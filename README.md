@@ -40,6 +40,60 @@ This project covers several key concepts, including distributed workflow orchest
 - **PostgreSQL**: Stores persistent workflow data and results.
 - **Worker**: Executes the tasks defined in the workflows, interacting with the Temporal Service.
 
+## How it works
+
+This section walks through what actually runs today in `src/`, end to end.
+
+### The moving pieces
+
+| File | Role |
+| --- | --- |
+| [src/main.ts](src/main.ts) | Boots the NestJS app and starts listening on port 3000. |
+| [src/app.module.ts](src/app.module.ts) | Root module; wires `WorkflowController` and `TemporalService` together. |
+| [src/workflow.controller.ts](src/workflow.controller.ts) | HTTP layer: `POST /workflow/start` and `GET /workflow/:id/status`. |
+| [src/temporal.service.ts](src/temporal.service.ts) | Temporal **client**: opens a connection to the Temporal server and asks it to start/describe workflows. |
+| [src/workflows.ts](src/workflows.ts) | The actual workflow logic (`exampleWorkflow`), executed by the worker, not by the NestJS process. |
+| [src/activities.ts](src/activities.ts) | Activities — the "do real work" steps a workflow calls out to (here, a simple `greet`). |
+| [src/worker.ts](src/worker.ts) | A separate Node process that polls Temporal for work and executes `workflows.ts`/`activities.ts`. |
+
+Two independent Node processes come out of this codebase:
+- **`app`** — the NestJS HTTP API (talks to Temporal as a *client*, never runs workflow code itself).
+- **`worker`** — polls Temporal and *executes* the workflow/activity code.
+
+They never call each other directly; Temporal is the broker in between. This separation is what gives Temporal its durability: if the worker crashes mid-workflow, Temporal remembers exactly where it was and resumes on another worker once one reconnects.
+
+### Request lifecycle: starting a workflow
+
+1. A client sends `POST /workflow/start`.
+2. `WorkflowController.startWorkflow()` delegates to `TemporalService.startWorkflow()`.
+3. `TemporalService` calls `client.start('exampleWorkflow', { taskQueue: 'exampleTaskQueue', workflowId, args })` on its `WorkflowClient`. This is a request to the Temporal **server** — it just records "please run this workflow" and returns immediately with a `workflowId`. No business logic has executed yet.
+4. Temporal places a workflow task on the `exampleTaskQueue`.
+5. The `worker` process, which has been polling that same task queue since startup, picks up the task and runs `exampleWorkflow(name)` from `workflows.ts`.
+6. Inside the workflow, `proxyActivities` schedules the `greet` activity. Temporal dispatches that as an *activity task*, also on `exampleTaskQueue`, which the same worker executes.
+7. `greet` runs and returns a string; the workflow returns that string as its result; the worker reports completion back to Temporal.
+8. The NestJS API never has to do anything else here — all of this happens asynchronously, driven by the worker and the Temporal server.
+
+### Request lifecycle: checking status
+
+1. A client sends `GET /workflow/:id/status`.
+2. `WorkflowController.getStatus()` delegates to `TemporalService.getWorkflowStatus(id)`.
+3. `TemporalService` calls `client.getHandle(id).describe()`, which asks the Temporal server for that workflow's current execution state (`RUNNING`, `COMPLETED`, `FAILED`, etc.) plus metadata like start time and history length.
+4. Temporal answers from its own persisted state (backed by PostgreSQL) — it doesn't need to contact the worker to answer this.
+
+### Why a separate worker process?
+
+Workflow code has to be deterministic (same inputs always produce the same sequence of decisions) because Temporal may replay it to rebuild state after a crash. Activities are where non-deterministic, "real" work happens — I/O, API calls, timestamps. Splitting workflow/activity execution into its own `worker` process (rather than running it inside the NestJS app) keeps the HTTP API free to scale independently, and lets you run many worker instances pulling from the same task queue without touching the API layer at all.
+
+### Local topology
+
+Running `docker compose up` starts four containers that map directly onto the pieces above:
+
+```
+app (NestJS, :3000) ──Temporal client──▶ temporal (:7233) ◀──polls── worker
+                                              │
+                                         postgres (:5432)
+```
+
 ## Local environment (cloud simulation)
 
 To emulate the project's cloud environment, we use Docker Compose to spin up the required services locally. This includes Temporal, PostgreSQL, and the NestJS application.
