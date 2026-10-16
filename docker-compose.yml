@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: workflows
+    ports:
+      - '5432:5432'
+  temporal:
+    image: temporalio/auto-setup:1.24.2
+    ports:
+      - '7233:7233'
+    environment:
+      DB: postgres12
+      DB_PORT: '5432'
+      POSTGRES_USER: user
+      POSTGRES_PWD: password
+      POSTGRES_SEEDS: postgres
+      TEMPORAL_CLI_ADDRESS: 'temporal:7233'
+      TEMPORAL_CLI_PORT: '7233'
+    depends_on:
+      - postgres
+  app:
+    build: .
+    ports:
+      - '3000:3000'
+    environment:
+      TEMPORAL_ADDRESS: 'temporal:7233'
+    depends_on:
+      - postgres
+      - temporal
+    restart: on-failure:10
+  worker:
+    build: .
+    command: ['node', 'dist/worker']
+    environment:
+      TEMPORAL_ADDRESS: 'temporal:7233'
+    depends_on:
+      - postgres
+      - temporal
+    restart: on-failure:10

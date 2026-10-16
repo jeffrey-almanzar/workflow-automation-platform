@@ -1,0 +1,7 @@
+{
+  "name": "Temporal Dev Container",
+  "dockerComposeFile": ["../docker-compose.yml"],
+  "service": "app",
+  "workspaceFolder": "/workspace",
+  "extensions": ["dbaeumer.vscode-eslint", "ms-vscode.vscode-typescript-tslint-plugin"]
+}
