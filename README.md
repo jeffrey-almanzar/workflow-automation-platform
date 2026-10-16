@@ -8,7 +8,7 @@
 
 **Technologies:** AWS Lambda, Temporal, NestJS, TypeScript, PostgreSQL, Docker
 
-**New technologies to learn:** Flask, Temporal
+**New technologies to learn:** NestJS, Temporal
 
 
 ## Phased plan
@@ -24,7 +24,7 @@ This project consists of building a workflow automation platform using Temporal,
 
 The system is made up of multiple components: a NestJS API acting as the interface for interacting with workflows, Temporal for managing workflow execution and persistence, and AWS Lambda for running serverless functions that can be invoked as part of the workflows. PostgreSQL is used as the database to store workflow state and results, while Docker is used to containerize the application and ease deployment.
 
-This project covers several key concepts, including distributed workflow orchestration, real-time state management, and the use of serverless technologies to scale applications. The engineer will also learn to work with Temporal and Flask, broadening their skills in building distributed, efficient backend solutions.
+This project covers several key concepts, including distributed workflow orchestration, real-time state management, and the use of serverless technologies to scale applications. 
 
 ## Architecture
 
@@ -143,19 +143,19 @@ For integration tests, it's recommended to use a test environment that emulates 
 
 ## Learning path
 
-### Flask
+### NestJS
 
-Flask is a Python microframework for building lightweight web applications and extending them as needed.
+NestJS is a progressive Node.js framework for building efficient, scalable server-side applications with TypeScript, built around modules, controllers, and providers with dependency injection.
 
-1. Start with the official Flask documentation to understand the basics.
-2. Build a simple Flask application that interacts with the NestJS API.
-3. Integrate Temporal into the Flask application to manage simple workflows.
-4. Deploy the Flask application in a Docker environment to simulate its integration into the project.
-5. Experiment with extending Flask via Blueprints and other common extensions.
+1. Start with the official NestJS documentation to understand modules, controllers, and providers.
+2. Build a simple NestJS controller/service pair and wire it up with dependency injection.
+3. Integrate Temporal into a NestJS service (as done in `temporal.service.ts`) to manage workflows.
+4. Deploy the NestJS application in a Docker environment to simulate its integration into the project.
+5. Experiment with NestJS features like pipes, guards, interceptors, and custom modules.
 
-- Flask Documentation
-- Miguel Grinberg's Flask Mega-Tutorial
-- Real Python Flask Tutorials
+- NestJS Documentation
+- NestJS Courses (official)
+- Awesome NestJS (community resources)
 
 ### Temporal
 
