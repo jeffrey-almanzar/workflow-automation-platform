@@ -4,18 +4,26 @@
 //
 // For now every external system is mocked. Each call has realistic latency and,
 // when MOCK_FAILURE_RATE is set (e.g. 0.3), fails randomly so you can watch
-// Temporal retry it in the UI. Each activity returns the ID of the resource it
-// created, which the workflow keeps for later compensation.
+// Temporal retry it in the UI. MOCK_FAILING_SYSTEMS (e.g. "GitHub,Slack") makes
+// those systems fail every call, to reproduce permanent outages.
+// Each activity returns the ID of the resource it created, which the workflow
+// keeps for compensation.
 
 import { log } from '@temporalio/activity';
 import type { NewHire } from './shared';
 
 const FAILURE_RATE = Number(process.env.MOCK_FAILURE_RATE ?? 0);
+const FAILING_SYSTEMS = new Set(
+  (process.env.MOCK_FAILING_SYSTEMS ?? '')
+    .split(',')
+    .map((name) => name.trim())
+    .filter(Boolean),
+);
 
 async function simulateCall(system: string, minMs = 200, maxMs = 1500): Promise<void> {
   const latency = minMs + Math.random() * (maxMs - minMs);
   await new Promise((resolve) => setTimeout(resolve, latency));
-  if (Math.random() < FAILURE_RATE) {
+  if (FAILING_SYSTEMS.has(system) || Math.random() < FAILURE_RATE) {
     throw new Error(`${system} is temporarily unavailable`);
   }
 }
@@ -82,9 +90,9 @@ export async function sendContractReminder(hire: NewHire): Promise<void> {
   log.info('Contract reminder sent', { employeeId: hire.employeeId, to: hire.personalEmail });
 }
 
-export async function escalateToHr(hire: NewHire, reason: string): Promise<void> {
+export async function escalateToHr(employeeId: string, reason: string): Promise<void> {
   await simulateCall('HR ticketing', 100, 500);
-  log.warn('Escalated to HR', { employeeId: hire.employeeId, reason });
+  log.warn('Escalated to HR', { employeeId, reason });
 }
 
 export async function notifyStartDateChanged(hire: NewHire, newStartDate: string): Promise<void> {
@@ -97,4 +105,48 @@ export async function sendWelcomeEmail(hire: NewHire, companyEmail: string): Pro
   await simulateCall('Email provider', 100, 500);
   log.info('Welcome email sent', { to: hire.personalEmail, companyEmail, startDate: hire.startDate });
   return `welcome-${hire.employeeId}`;
+}
+
+// --- Undo operations ---
+// Used both as saga compensations (cancelled/failed onboarding) and by offboarding.
+// Each one must be idempotent: Temporal may retry it, so "already gone" is success.
+
+export async function archiveHrRecord(employeeId: string, hrRecordId: string): Promise<void> {
+  await simulateCall('HR system');
+  log.info('HR record archived', { employeeId, hrRecordId });
+}
+
+export async function voidContract(employeeId: string, envelopeId: string): Promise<void> {
+  await simulateCall('E-signature service');
+  log.info('Contract voided', { employeeId, envelopeId });
+}
+
+export async function deactivateEmailAccount(employeeId: string, email: string): Promise<void> {
+  await simulateCall('Email provider');
+  log.info('Email account deactivated', { employeeId, email });
+}
+
+export async function deactivateSlackAccount(employeeId: string, slackUserId: string): Promise<void> {
+  await simulateCall('Slack');
+  log.info('Slack account deactivated', { employeeId, slackUserId });
+}
+
+export async function revokeGithubAccess(employeeId: string, inviteId: string): Promise<void> {
+  await simulateCall('GitHub');
+  log.info('GitHub access revoked', { employeeId, inviteId });
+}
+
+export async function cancelLaptopOrder(employeeId: string, orderId: string): Promise<void> {
+  await simulateCall('Laptop vendor', 1000, 3000);
+  log.info('Laptop order cancelled', { employeeId, orderId });
+}
+
+export async function removeFromPayroll(employeeId: string, payrollId: string): Promise<void> {
+  await simulateCall('Payroll');
+  log.info('Removed from payroll', { employeeId, payrollId });
+}
+
+export async function requestLaptopReturn(employeeId: string, orderId: string): Promise<void> {
+  await simulateCall('Laptop vendor', 500, 1500);
+  log.info('Laptop return shipping label sent', { employeeId, orderId });
 }

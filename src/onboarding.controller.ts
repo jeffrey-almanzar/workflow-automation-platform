@@ -1,7 +1,7 @@
-// Controller exposing endpoints to start, advance and monitor employee onboardings.
+// Controller exposing endpoints to start, advance, cancel and monitor employee onboardings.
 
 import { Body, Controller, Get, HttpCode, HttpStatus, Param, Patch, Post } from '@nestjs/common';
-import { IsDateString, IsEmail, IsIn, IsNotEmpty, IsString, Matches } from 'class-validator';
+import { IsDateString, IsEmail, IsIn, IsNotEmpty, IsString, Matches, MaxLength } from 'class-validator';
 import { NewHire, ROLES, Role } from './shared';
 import { TemporalService } from './temporal.service';
 
@@ -26,6 +26,13 @@ export class CreateOnboardingDto implements NewHire {
 export class UpdateStartDateDto {
   @IsDateString({ strict: true })
   startDate!: string;
+}
+
+export class CancelOnboardingDto {
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(500)
+  reason!: string;
 }
 
 @Controller('onboardings')
@@ -56,5 +63,12 @@ export class OnboardingController {
   @HttpCode(HttpStatus.ACCEPTED)
   updateStartDate(@Param('id') id: string, @Body() dto: UpdateStartDateDto) {
     return this.temporalService.updateStartDate(id, dto.startDate);
+  }
+
+  // E.g. the offer was withdrawn. Undoes everything completed so far (saga).
+  @Post(':id/cancellation')
+  @HttpCode(HttpStatus.ACCEPTED)
+  cancel(@Param('id') id: string, @Body() dto: CancelOnboardingDto) {
+    return this.temporalService.cancelOnboarding(id, dto.reason);
   }
 }

@@ -51,6 +51,8 @@ services:
       TEMPORAL_ADDRESS: 'temporal:7233'
       # Probability (0-1) that a mocked external call fails, to exercise retries.
       MOCK_FAILURE_RATE: '${MOCK_FAILURE_RATE:-0}'
+      # Comma-separated mocked systems that always fail, e.g. "GitHub,Slack".
+      MOCK_FAILING_SYSTEMS: '${MOCK_FAILING_SYSTEMS:-}'
     depends_on:
       - postgres
       - temporal

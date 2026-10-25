@@ -44,7 +44,7 @@ This project covers several key concepts, including distributed workflow orchest
 
 This section walks through what actually runs today in `src/`, end to end.
 
-### The use case: employee onboarding
+### The use case: employee onboarding and offboarding
 
 When someone is hired, a contract must be signed and several independent systems set up (HR record, company email, Slack, GitHub for engineers, a laptop order, payroll) before a welcome email goes out just before day one. The process spans weeks and depends on humans, which is exactly what `onboardingWorkflow` orchestrates:
 
@@ -63,7 +63,20 @@ POST /onboardings ──▶ onboardingWorkflow(newHire)
   4. sleep until 1 day before the start date (may be weeks)
        updateStartDate signal → notifyStartDateChanged, timer recomputed
   5. sendWelcomeEmail → COMPLETED
-     (FAILED if any step exhausted its retries)
+
+  cancelOnboarding signal (any time) ┐ saga: undo every completed step in
+  or a step exhausts its retries     ┘ reverse order → CANCELLED / FAILED
+```
+
+When the employee later leaves, `offboardingWorkflow` tears down what onboarding created, reusing the same undo activities:
+
+```
+POST /offboardings ──▶ offboardingWorkflow(employeeId, resources from onboarding)
+  1. sleep until revokeAccessAt (or start immediately)
+  2. deactivate email, Slack, GitHub        (in parallel: security-critical, first)
+  3. remove from payroll, request laptop return
+  4. archive HR record
+  any step still failing after retries → escalateToHr → COMPLETED_WITH_ERRORS
 ```
 
 | Endpoint | What it does |
@@ -72,10 +85,13 @@ POST /onboardings ──▶ onboardingWorkflow(newHire)
 | `GET /onboardings/:id` | Live progress: phase, % complete, per-step status, contract state, scheduled welcome time. |
 | `POST /onboardings/:id/contract-signature` | Sends the `contractSigned` signal (in production, the e-signature provider's webhook). Idempotent. |
 | `PATCH /onboardings/:id/start-date` | Sends the `updateStartDate` signal with `{ "startDate": "..." }`. |
+| `POST /onboardings/:id/cancellation` | Sends the `cancelOnboarding` signal with `{ "reason": "..." }` and rolls back everything done so far. |
+| `POST /offboardings` | `{ "employeeId", "reason", "revokeAccessAt"? }`. Only for a completed onboarding (`409` otherwise, `404` if none). |
+| `GET /offboardings/:id` | Live offboarding progress. |
 
 Signals to an unknown onboarding return `404`; to one that already finished, `409`.
 
-The external systems are mocked for now ([src/activities.ts](src/activities.ts)), with realistic latency and optional random failures.
+The external systems are mocked for now ([src/activities.ts](src/activities.ts)), with realistic latency, optional random failures, and optional permanent outages per system.
 
 ### The moving pieces
 
@@ -83,11 +99,12 @@ The external systems are mocked for now ([src/activities.ts](src/activities.ts))
 | --- | --- |
 | [src/main.ts](src/main.ts) | Boots the NestJS app, enables request validation, and listens on port 3000. |
 | [src/app.module.ts](src/app.module.ts) | Root module; wires `OnboardingController` and `TemporalService` together. |
-| [src/onboarding.controller.ts](src/onboarding.controller.ts) | HTTP layer and request DTO: `POST /onboardings` and `GET /onboardings/:id`. |
+| [src/onboarding.controller.ts](src/onboarding.controller.ts) | HTTP layer and request DTOs for `/onboardings` (start, progress, signature, start date, cancellation). |
+| [src/offboarding.controller.ts](src/offboarding.controller.ts) | HTTP layer and request DTO for `/offboardings`. |
 | [src/temporal.service.ts](src/temporal.service.ts) | Temporal **client**: starts, signals and queries onboarding workflows; maps Temporal errors to HTTP 404/409. |
 | [src/shared.ts](src/shared.ts) | Types, task queue name, default timings, and the query/signal definitions shared by the API and the worker. |
-| [src/workflows.ts](src/workflows.ts) | The orchestration logic (`onboardingWorkflow`), executed by the worker, not by the NestJS process. |
-| [src/activities.ts](src/activities.ts) | Activities: one per external system (HR, e-signature, email, Slack, GitHub, laptop vendor, payroll) plus notifications. |
+| [src/workflows.ts](src/workflows.ts) | The orchestration logic (`onboardingWorkflow`, `offboardingWorkflow`), executed by the worker, not by the NestJS process. |
+| [src/activities.ts](src/activities.ts) | Activities: one per external-system operation, plus the matching undo operation for each, plus notifications. |
 | [src/worker.ts](src/worker.ts) | A separate Node process that polls Temporal for work and executes `workflows.ts`/`activities.ts`. |
 
 Two independent Node processes come out of this codebase:
@@ -122,6 +139,28 @@ if (!(await condition(signed, '3 days'))) {   // resolves early if the signal ar
 - **Timers** (`condition(..., timeout)`) are stored by the Temporal server, not held in worker memory. Nothing runs while waiting, and the wait survives worker crashes and redeploys: if the worker is down when a timer expires, the workflow continues as soon as a worker reconnects.
 - **Changing the start date** wakes the sleeping workflow, which propagates the change and recomputes the timer from the new date.
 - **Timings are workflow input**, not config read inside the workflow. They are recorded in history, so changing them later only affects new onboardings, never ones already in flight.
+
+### Rolling back: the saga pattern
+
+Onboarding touches several independent systems, so there is no transaction to roll back when it is cancelled (offer withdrawn) or a step fails for good. Instead, every step that has a side effect has a matching **compensation** that undoes it, and the workflow runs the compensations for the completed steps in **reverse order of completion**:
+
+```
+✅ HR record → ✅ contract → ✅ email, Slack, laptop, payroll → ❌ GitHub (5 attempts)
+                                         ↓
+   cancel laptop → remove payroll → deactivate Slack → deactivate email → void contract → archive HR record
+```
+
+Design decisions worth calling out:
+
+- **Each step registers its compensation as soon as its side effect exists**, using the resource ID the activity returned (email address, order number, ...). The contract is registered when it is *sent*, not when signed, so cancelling during the signature wait still voids it.
+- **Cancellation interrupts waits, not in-flight calls.** A cancel ends a pending timer or signature wait immediately, but provisioning calls already running are allowed to finish (`Promise.allSettled`) before the rollback starts. Interrupting them would risk a call that actually succeeded at the vendor but was never recorded, leaving an orphaned account the saga doesn't know about.
+- **Compensations are more patient than forward steps**: 10 attempts with backoff capped at 1 minute, instead of 5. One that still fails is marked `compensation_failed`, the rest still run, and HR is asked to finish the cleanup by hand.
+- **Compensations are idempotent**, since Temporal may retry them: "already deactivated" counts as success.
+- **Irreversible steps go last.** The welcome email can't be unsent, so it has no compensation and is the final step.
+- **The rollback runs in a non-cancellable scope**, so it completes even if the workflow is cancelled through Temporal itself (UI or CLI) instead of the API.
+- **A cancel is a business outcome, not an error.** A cancelled onboarding completes normally with status `CANCELLED`; only a real failure ends the workflow as `FAILED`.
+
+Offboarding reuses the same undo activities. Tearing down an employee is the same set of operations as rolling back a cancelled hire, so it starts from the resource IDs in the completed onboarding's result.
 
 ### Request lifecycle: checking progress
 
@@ -175,6 +214,12 @@ To emulate the project's cloud environment, we use Docker Compose to spin up the
    Then stop the worker (`docker compose stop worker`) while a contract is unsigned, wait past the deadlines, and start it again: the reminder and escalation fire as soon as it reconnects.
 8. To watch retries happen, make the mocked systems fail randomly and restart the worker:
    `MOCK_FAILURE_RATE=0.5 docker compose up -d worker`. Failed attempts appear as retries in the Web UI.
+9. To see the saga roll back, cancel an onboarding at any stage:
+   `curl -X POST localhost:3000/onboardings/onboarding-E1001/cancellation -H 'Content-Type: application/json' -d '{"reason":"Offer withdrawn"}'`
+   or simulate a permanent outage, so provisioning fails and everything else is undone:
+   `MOCK_FAILING_SYSTEMS=GitHub docker compose up -d worker`
+10. Once an onboarding has completed, offboard the employee:
+    `curl -X POST localhost:3000/offboardings -H 'Content-Type: application/json' -d '{"employeeId":"E1001","reason":"Resigned"}'`
 
 ## Cloud deployment
 

@@ -1,4 +1,4 @@
-// Service that talks to Temporal to start, signal and monitor workflows.
+// Service that talks to Temporal to start, signal and monitor onboarding/offboarding workflows.
 
 import { ConflictException, Injectable, NotFoundException, OnModuleInit } from '@nestjs/common';
 import {
@@ -7,16 +7,19 @@ import {
   WorkflowExecutionAlreadyStartedError,
   WorkflowNotFoundError,
 } from '@temporalio/client';
+import type { QueryDefinition } from '@temporalio/common';
 import ms, { type StringValue } from 'ms';
 import {
   NewHire,
   OnboardingTimings,
   TASK_QUEUE,
+  cancelOnboardingSignal,
   contractSignedSignal,
+  offboardingProgressQuery,
   progressQuery,
   updateStartDateSignal,
 } from './shared';
-import type { onboardingWorkflow } from './workflows';
+import type { offboardingWorkflow, onboardingWorkflow } from './workflows';
 
 const QUERY_TIMEOUT_MS = 3000;
 
@@ -71,21 +74,75 @@ export class TemporalService implements OnModuleInit {
     }
   }
 
-  async getOnboarding(workflowId: string) {
+  getOnboarding(workflowId: string) {
+    return this.getState('onboarding', workflowId, progressQuery);
+  }
+
+  signContract(workflowId: string): Promise<void> {
+    return this.signal(workflowId, (handle) => handle.signal(contractSignedSignal));
+  }
+
+  updateStartDate(workflowId: string, startDate: string): Promise<void> {
+    return this.signal(workflowId, (handle) => handle.signal(updateStartDateSignal, startDate));
+  }
+
+  cancelOnboarding(workflowId: string, reason: string): Promise<void> {
+    return this.signal(workflowId, (handle) => handle.signal(cancelOnboardingSignal, reason));
+  }
+
+  async startOffboarding(employeeId: string, reason: string, revokeAccessAt?: string): Promise<string> {
+    // Offboarding tears down exactly what onboarding created, so it starts from
+    // the finished onboarding's result (its resource IDs).
+    const onboarding = this.client.workflow.getHandle<typeof onboardingWorkflow>(`onboarding-${employeeId}`);
+    const description = await onboarding.describe().catch((err) => {
+      if (err instanceof WorkflowNotFoundError) {
+        throw new NotFoundException(`No onboarding found for employee ${employeeId}`);
+      }
+      throw err;
+    });
+    const result = description.status.name === 'COMPLETED' ? await onboarding.result() : null;
+    if (result?.status !== 'COMPLETED') {
+      throw new ConflictException(
+        `Onboarding for ${employeeId} is ${result?.status ?? description.status.name}; ` +
+          'only completed onboardings can be offboarded (cancel an in-progress one instead)',
+      );
+    }
+
+    const workflowId = `offboarding-${employeeId}`;
+    try {
+      await this.client.workflow.start<typeof offboardingWorkflow>('offboardingWorkflow', {
+        taskQueue: TASK_QUEUE,
+        workflowId,
+        args: [{ employeeId, reason, revokeAccessAt, resources: result.resources }],
+      });
+      return workflowId;
+    } catch (err) {
+      if (err instanceof WorkflowExecutionAlreadyStartedError) {
+        throw new ConflictException(`Offboarding already in progress for employee ${employeeId}`);
+      }
+      throw err;
+    }
+  }
+
+  getOffboarding(workflowId: string) {
+    return this.getState('offboarding', workflowId, offboardingProgressQuery);
+  }
+
+  private async getState<T>(kind: 'onboarding' | 'offboarding', workflowId: string, query: QueryDefinition<T>) {
     const handle = this.client.workflow.getHandle(workflowId);
     try {
       // describe() comes from the Temporal server; the query is answered by the
       // workflow's own in-memory state, which requires a worker to be running.
       const description = await handle.describe();
       const summary = {
-        onboardingId: workflowId,
+        [`${kind}Id`]: workflowId,
         workflowStatus: description.status.name,
         startedAt: description.startTime,
         closedAt: description.closeTime ?? null,
       };
       try {
         const progress = await this.client.withDeadline(Date.now() + QUERY_TIMEOUT_MS, () =>
-          handle.query(progressQuery),
+          handle.query(query),
         );
         return { ...summary, ...progress };
       } catch {
@@ -95,18 +152,10 @@ export class TemporalService implements OnModuleInit {
       }
     } catch (err) {
       if (err instanceof WorkflowNotFoundError) {
-        throw new NotFoundException(`Onboarding ${workflowId} not found`);
+        throw new NotFoundException(`${kind === 'onboarding' ? 'Onboarding' : 'Offboarding'} ${workflowId} not found`);
       }
       throw err;
     }
-  }
-
-  signContract(workflowId: string): Promise<void> {
-    return this.signal(workflowId, (handle) => handle.signal(contractSignedSignal));
-  }
-
-  updateStartDate(workflowId: string, startDate: string): Promise<void> {
-    return this.signal(workflowId, (handle) => handle.signal(updateStartDateSignal, startDate));
   }
 
   private async signal(

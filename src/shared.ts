@@ -43,12 +43,22 @@ export type StepName =
   | 'laptop'
   | 'payroll'
   | 'welcome';
-export type StepStatus = 'pending' | 'running' | 'done' | 'failed';
+export type StepStatus =
+  | 'pending'
+  | 'running'
+  | 'done'
+  | 'failed'
+  // Saga states: a completed step being (or having been) undone.
+  | 'compensating'
+  | 'compensated'
+  | 'compensation_failed';
 export type OnboardingStatus =
   | 'AWAITING_CONTRACT'
   | 'PROVISIONING'
   | 'AWAITING_START_DATE'
+  | 'COMPENSATING'
   | 'COMPLETED'
+  | 'CANCELLED'
   | 'FAILED';
 
 export interface ContractState {
@@ -58,15 +68,21 @@ export interface ContractState {
   escalatedAt: string | null;
 }
 
+export interface Cancellation {
+  requestedAt: string;
+  reason: string;
+}
+
 export interface OnboardingProgress {
   status: OnboardingStatus;
   percentComplete: number;
   startDate: string;
   welcomeEmailAt: string | null; // when the welcome email is (or was) scheduled
   contract: ContractState;
+  cancellation: Cancellation | null;
   steps: Partial<Record<StepName, StepStatus>>;
   // IDs returned by each external system (email address, ticket number, ...).
-  // Needed later to undo a step during compensation.
+  // Used to undo a step during compensation, and handed to offboarding later.
   resources: Partial<Record<StepName, string>>;
 }
 
@@ -76,3 +92,26 @@ export const progressQuery = defineQuery<OnboardingProgress>('progress');
 // External events that move the onboarding forward.
 export const contractSignedSignal = defineSignal('contractSigned');
 export const updateStartDateSignal = defineSignal<[string]>('updateStartDate');
+export const cancelOnboardingSignal = defineSignal<[string]>('cancelOnboarding'); // arg: reason
+
+// --- Offboarding ---
+
+export type OffboardingStep = 'email' | 'slack' | 'github' | 'payroll' | 'laptop' | 'hrRecord';
+export type OffboardingStatus = 'SCHEDULED' | 'REVOKING_ACCESS' | 'COMPLETED' | 'COMPLETED_WITH_ERRORS';
+
+export interface OffboardingRequest {
+  employeeId: string;
+  reason: string;
+  // When access is cut off. Omitted = immediately (e.g. termination for cause).
+  revokeAccessAt?: string;
+  // What onboarding created, i.e. what must now be torn down.
+  resources: Partial<Record<StepName, string>>;
+}
+
+export interface OffboardingProgress {
+  status: OffboardingStatus;
+  revokeAccessAt: string;
+  steps: Partial<Record<OffboardingStep, StepStatus>>;
+}
+
+export const offboardingProgressQuery = defineQuery<OffboardingProgress>('offboardingProgress');
