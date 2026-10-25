@@ -17,6 +17,9 @@ The point of the project is the hard parts of backend work that a simple CRUD ap
 | **Measured performance** | 10 onboardings/s sustained locally with p95 API latency of 91 ms and zero errors; the load test also found and fixed two real bugs. Results, including what didn't work, are below. |
 | **Deployed** | One `terraform apply` builds the images, creates the AWS infrastructure (EC2, Lambda, ECR, least-privilege IAM, budget alerts) and starts the stack. |
 
+![Grafana business outcomes: 907 onboardings completed, 7 rolled back, 1 escalated to HR, 246 duplicate vendor calls prevented](docs/images/grafana-business-outcomes.png)
+<sub>From the project's Grafana dashboard after a local run with injected vendor failures (5% errors, 5% lost responses): every lost response was answered from the stored result instead of creating a duplicate.</sub>
+
 ## Contents
 
 - [The problem](#the-problem)
@@ -70,19 +73,15 @@ curl localhost:3000/employees/E1                                           # rec
 | http://localhost:3001 | Grafana dashboard (no login) |
 | http://localhost:9090 | Prometheus |
 
-To see failures and recovery (worker crashes, vendor outages, lost responses, cancellations), follow the scenarios in [docs/PROJECT_NOTES.md](docs/PROJECT_NOTES.md#demo-scenarios).
+To see failures and recovery (worker crashes, vendor outages, lost responses, cancellations), follow the scenarios in [docs/PROJECT_NOTES.md](docs/PROJECT_NOTES.md#demo-scenarios). After running them, the Temporal UI looks like this:
+
+![Temporal UI workflow list: one onboarding still waiting for a signature, six completed (including one cancelled and an offboarding) and one failed](docs/images/temporal-workflow-list.png)
+
+A cancelled onboarding shows as *Completed* in Temporal: cancellation is a business outcome, and the workflow's own status (`CANCELLED`) is in `GET /onboardings/:id`.
 
 ## Architecture
 
-```
-[Client] ──HTTP──▶ [NestJS API] ──start / signal / query──▶ [Temporal Server] ◀──polls── [Worker]
-                        │                                          │                       │
-                        │ reads                                    │ persists              ├─ writes ──▶ [PostgreSQL]
-                        ▼                                          ▼                       │              ▲
-                   [PostgreSQL] ◀───────────────────────── (separate DBs) ─────────────────┘              │
-                                                                                           └─ invokes ─▶ [Lambda "vendors"]
-                                                                                                      (own schema, idempotency)
-```
+![Architecture: the client calls the NestJS API, which starts, signals and queries workflows on the Temporal server; the worker polls Temporal, writes records and audit events to PostgreSQL, and invokes the vendors Lambda with an idempotency key; Temporal, the app and the vendors each keep their data in PostgreSQL](docs/diagrams/architecture.svg)
 
 | Component | Role |
 | --- | --- |
@@ -96,21 +95,7 @@ The API and worker are separate processes on purpose: workflow code must be dete
 
 ## How a hire flows through the system
 
-```
-POST /onboardings ──▶ onboardingWorkflow
-  1. createHrRecord
-  2. sendContract → wait for the "contractSigned" signal
-       unsigned after 3 days → reminder            (durable timer)
-       unsigned 4 days later → escalate to HR, keep waiting
-  3. in parallel: email, Slack, GitHub (engineers only), laptop order, payroll
-       each retried independently with exponential backoff
-  4. sleep until 1 day before the start date (may be weeks)
-       "updateStartDate" signal → notify laptop vendor, recompute the timer
-  5. welcome email → employee ACTIVE
-
-  "cancelOnboarding" signal, or a step failing for good, at any point:
-  → undo every completed step in reverse order → CANCELLED / FAILED
-```
+![Onboarding workflow: create HR record, send contract, wait for the signature with a reminder after 3 days and HR escalation after 7, provision email, Slack, GitHub, laptop and payroll in parallel, sleep until the day before the start date (rescheduled by the updateStartDate signal), send the welcome email and activate the employee; a cancel signal or a permanent failure leads to the saga rollback](docs/diagrams/onboarding-flow.svg)
 
 Offboarding (`POST /offboardings`) waits until the requested time, cuts access first (email, Slack, GitHub in parallel), then payroll and laptop return, and archives the HR record last. Anything that still fails after retries is escalated to HR rather than silently left behind.
 
@@ -146,15 +131,15 @@ if (!(await condition(signed, '3 days'))) {   // returns early if the signal arr
 - Signal handlers only record the event; the main flow decides what to do. A start-date change wakes the sleeping workflow, which recomputes the timer.
 - Timings are passed as workflow input rather than read from config inside the workflow. They are recorded in history, so changing the config never alters onboardings already running.
 
+An onboarding whose contract went unsigned, run with demo timers of 20 seconds instead of days (Temporal lists events newest first): timer, reminder, timer, HR escalation, then the signature arrives and provisioning starts.
+
+![Temporal event history for an onboarding: createHrRecord, sendContract, a 20s timer, sendContractReminder, another 20s timer, escalateToHr, the contractSigned signal, then the provisioning activities with their resource IDs, the welcome email and activateEmployee](docs/images/temporal-reminder-escalation.png)
+
 ### Undoing work across systems: the saga pattern
 
 There is no transaction spanning Slack, payroll and a laptop vendor. Every step with a side effect has a matching undo, registered as soon as the side effect exists, and on cancellation or permanent failure the workflow runs the undos in reverse order of completion.
 
-```
-✅ HR record → ✅ contract → ✅ email, Slack, laptop, payroll → ❌ GitHub (5 attempts)
-                                        ↓
-  cancel laptop → remove payroll → deactivate Slack → deactivate email → void contract → archive HR record
-```
+![Saga: forward steps HR record, contract, email, Slack, laptop, payroll, then GitHub fails after 5 attempts and triggers the rollback, which removes payroll, cancels the laptop order, deactivates Slack and email, voids the contract and archives the HR record, escalating anything that still fails to HR](docs/diagrams/saga.svg)
 
 Decisions that matter:
 
@@ -165,6 +150,14 @@ Decisions that matter:
 - **A cancellation is a business outcome, not an error**: the workflow completes with status `CANCELLED`; only real failures end as `FAILED`.
 
 Offboarding reuses the same undo operations, starting from the resource IDs the onboarding recorded.
+
+**In the Temporal UI.** A hire cancelled while waiting for the start date (newest events first). Read from the bottom: the forward steps with the resource IDs they created, the start-date timer, the `cancelOnboarding` signal with its reason, then every undo. The provisioning steps finished in the order GitHub, email, Slack, payroll, laptop; the undos run laptop, payroll, Slack, email, GitHub, then the contract and the HR record:
+
+![Temporal event history of a cancelled onboarding: provisioning results, the start-date timer, the cancelOnboarding signal with reason "Candidate accepted another offer", then cancelLaptopOrder, removeFromPayroll, deactivateSlackAccount, deactivateEmailAccount, revokeGithubAccess, voidContract and archiveHrRecord](docs/images/temporal-cancelled-saga.png)
+
+And a vendor outage: GitHub keeps failing (the red bar is about 17 seconds of retries with backoff), the workflow gives up, and the completed steps are rolled back:
+
+![Temporal timeline of a failed onboarding: grantGithubAccess failing for about 17 seconds of retries, followed by cancelLaptopOrder, removeFromPayroll and the other compensations](docs/images/temporal-outage-rollback.png)
 
 ### Retries without duplicates: idempotency keys
 
@@ -240,18 +233,20 @@ Prometheus and Grafana run locally alongside the stack, with a provisioned dashb
 
 Metrics come from the API (`prom-client`), the worker (Temporal SDK exporter plus custom counters for every audit event and every replayed vendor response) and the Temporal server. Every action is also written to an audit log in PostgreSQL, exposed at `GET /employees/:id`.
 
+<details>
+<summary><b>The full dashboard</b> after a 3-minute run at 5 hires/s with injected vendor failures</summary>
+
+![Grafana dashboard: business outcomes and events per minute; API requests, latency percentiles and status codes; workflow completions, activity latency and failures by type, queueing delay, worker slots and Temporal persistence latency](docs/images/grafana-dashboard.png)
+
+The spike at the right edge is about 900 onboardings released at once (their start dates moved to today with a single batch signal): completions jump to about 15/s while queueing delay rises to about 20 s, the same saturation pattern measured in the load tests. Some counters undercount the first event of a new series, a known Prometheus behavior on low traffic.
+
+</details>
+
 ## Deployment on AWS
 
 Everything is in [infra/](infra/) (Terraform). One `terraform apply` builds and pushes both images, creates the infrastructure and boots the stack.
 
-```
-              your IP only, :3000
-Internet ──────────────────────────▶ EC2 t4g.small (docker compose)
-                                       ├─ API, worker      (image from ECR)
-                                       ├─ Temporal (+ UI, reachable only through SSM)
-                                       ├─ worker ── lambda:InvokeFunction ──▶ Lambda "vendors" (in the VPC)
-                                       └─ PostgreSQL ◀── :5432 from the Lambda's security group only
-```
+![AWS deployment: your IP reaches the API on an EC2 t4g.small running the API, worker, Temporal and PostgreSQL with docker compose; the worker invokes the vendors Lambda in the same VPC, which reaches PostgreSQL through its security group; ECR, SSM, CloudWatch Logs, IAM roles and Budgets support it; Terraform provisions everything](docs/diagrams/aws-deployment.svg)
 
 | Concern | Choice |
 | --- | --- |
@@ -305,3 +300,5 @@ Deliberate scope limits for a portfolio project, and what a production version w
 | [monitoring/](monitoring/) | Prometheus config and Grafana dashboard |
 | [loadtest/k6.js](loadtest/k6.js) | Load test |
 | [docs/PROJECT_NOTES.md](docs/PROJECT_NOTES.md) | Maintainer notes: running, operating, explaining the project |
+| [docs/diagrams/](docs/diagrams/) | Diagram sources ([D2](https://d2lang.com)); `npm run docs:diagrams` regenerates the SVGs |
+| [docs/images/](docs/images/) | Screenshots of the Temporal UI, Grafana and the AWS console |

@@ -1,0 +1,45 @@
+# The onboarding workflow. Render with: npm run docs:diagrams
+direction: down
+
+start: POST /onboardings {shape: oval}
+hr: Create HR record
+contract: Send contract
+
+sig_wait: Wait for signature {
+  shape: diamond
+}
+reminder: "Reminder\n(3 days unsigned)"
+escalate: "Escalate to HR\n(7 days unsigned)"
+
+provision: Provision in parallel · retried with backoff {
+  grid-columns: 5
+  email: Email
+  slack: Slack
+  github: "GitHub\n(engineers)"
+  laptop: Laptop order
+  payroll: Payroll
+}
+
+start_wait: "Sleep until the day\nbefore the start date" {
+  shape: diamond
+}
+welcome: Welcome email
+active: Employee ACTIVE {shape: oval}
+
+rollback: "Rollback (saga)\nundo completed steps in reverse order\n→ CANCELLED / FAILED" {
+  shape: hexagon
+}
+
+start -> hr -> contract -> sig_wait
+sig_wait -> reminder: timer {style.stroke-dash: 4}
+reminder -> escalate: timer {style.stroke-dash: 4}
+escalate -> sig_wait: keep waiting {style.stroke-dash: 4}
+sig_wait -> provision: "signal: contractSigned"
+provision -> start_wait
+start_wait -> start_wait: "signal: updateStartDate\n→ reschedule"
+start_wait -> welcome: timer fires
+welcome -> active
+
+sig_wait -> rollback: "signal: cancelOnboarding" {style.stroke-dash: 3; style.stroke: "#d9480f"}
+provision -> rollback: step fails for good {style.stroke-dash: 3; style.stroke: "#d9480f"}
+start_wait -> rollback: "signal: cancelOnboarding" {style.stroke-dash: 3; style.stroke: "#d9480f"}

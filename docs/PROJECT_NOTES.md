@@ -220,6 +220,19 @@ terraform destroy                              # removes everything, including t
 - **`terraform.tfstate` exists only on this machine** (git-ignored; it contains the generated DB password). Back it up. Without it, Terraform can't manage or destroy the resources, and they'd have to be deleted by hand. Production would keep state in S3 with locking.
 - Cost is about $17/month from credits. Budget alerts email you for any charge credits don't cover, and when forecast monthly usage exceeds $25. Destroy when not demoing.
 
+## Diagrams and screenshots
+
+**Diagrams** are [D2](https://d2lang.com) sources in [docs/diagrams/](diagrams/). After editing one, run `npm run docs:diagrams` (needs `brew install d2`). The SVGs switch between light and dark with the viewer's theme, and AWS icons are embedded, because GitHub blocks external images inside SVGs. Layout gotcha: the ELK layout engine ignores `direction` inside containers, which is why the saga diagram uses a two-column grid.
+
+**Screenshots** in [docs/images/](images/):
+
+- **Temporal UI and Grafana:** captured with a headless browser (Playwright) against the local stack, after seeding data:
+  1. Point Temporal at a clean database so the workflow list isn't cluttered: `TEMPORAL_DB=temporal_demo` plus the demo timers.
+  2. Run the [demo scenarios](#demo-scenarios), then a short k6 run at 5/s with `MOCK_FAILURE_RATE=0.05 MOCK_LOST_RESPONSE_RATE=0.05` for Grafana.
+  3. With demo timers, k6 hires (start date one hour out) wait for the welcome email. Release them with a batch signal: `temporal workflow signal --query "ExecutionStatus='Running' AND WorkflowId STARTS_WITH 'onboarding-lt-'" --name updateStartDate --input '"<now>"' --yes`.
+  4. In the Temporal UI, the **Compact** event history view reads better than the timeline when the steps are close together in time.
+- **AWS console:** taken by hand. Before publishing, crop out the browser bar and console header (account ID, account alias, bookmarks) and blur public IPs.
+
 ## Gotchas and lessons
 
 | Symptom | Cause and fix |
