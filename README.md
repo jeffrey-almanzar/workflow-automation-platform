@@ -260,6 +260,22 @@ Internet ───────────────────────�
 | Cost | About $17/month. Two budget alerts by email: any charge not covered by credits, and forecast usage above $25/month. `terraform destroy` removes everything. |
 | Updates | `terraform apply` rebuilds only images whose sources changed and updates the Lambda; `infra/scripts/redeploy.sh` rolls the new images onto the host through SSM without replacing it or its data. |
 
+### Running on AWS
+
+Every resource Terraform creates is tagged `Project = onboarding`, so the whole deployment shows up as one resource group:
+
+![AWS resource group listing the 13 regional resources of the deployment: the SSM parameter, Lambda log group, vendors Lambda, two ECR repositories, security groups and rules, and the EC2 instance](docs/images/aws-resource-group.png)
+
+The EC2 host running the stack (ARM `t4g.small`, all status checks passing):
+
+![EC2 console showing the onboarding-app instance running as a t4g.small with 3/3 status checks passed](docs/images/aws-ec2.png)
+
+The vendors Lambda after one onboarding against the cloud API: 7 vendor calls (contract, five provisioning steps, welcome email), 0 errors, 100% success. Durations of 144 ms to 1.8 s are the simulated vendor latency:
+
+![Lambda Monitor tab for onboarding-vendors: 7 invocations, average duration 990 ms, 0 errors and 100% success rate](docs/images/aws-lambda-monitor.png)
+
+![Recent invocations of onboarding-vendors in CloudWatch Logs, with request IDs, log streams and durations](docs/images/aws-lambda-logs.png)
+
 Step-by-step instructions are in [docs/PROJECT_NOTES.md](docs/PROJECT_NOTES.md#deploying-to-aws).
 
 ## Limitations and next steps
