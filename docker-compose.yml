@@ -35,6 +35,7 @@ services:
       - '3000:3000'
     environment:
       TEMPORAL_ADDRESS: 'temporal:7233'
+      DATABASE_URL: 'postgres://user:password@postgres:5432/workflows'
       # Shorten the human-step timers for local demos, e.g. CONTRACT_REMINDER_DELAY="30 seconds".
       # Empty = production defaults (3 days / 4 more days / 1 day before start).
       CONTRACT_REMINDER_DELAY: '${CONTRACT_REMINDER_DELAY:-}'
@@ -49,11 +50,30 @@ services:
     command: ['node', 'dist/worker']
     environment:
       TEMPORAL_ADDRESS: 'temporal:7233'
-      # Probability (0-1) that a mocked external call fails, to exercise retries.
-      MOCK_FAILURE_RATE: '${MOCK_FAILURE_RATE:-0}'
-      # Comma-separated mocked systems that always fail, e.g. "GitHub,Slack".
-      MOCK_FAILING_SYSTEMS: '${MOCK_FAILING_SYSTEMS:-}'
+      DATABASE_URL: 'postgres://user:password@postgres:5432/workflows'
+      # Local Lambda Invoke API. On AWS, leave LAMBDA_ENDPOINT unset and set
+      # VENDOR_FUNCTION_NAME to the deployed function's name.
+      LAMBDA_ENDPOINT: 'http://vendors:8080'
+      VENDOR_FUNCTION_NAME: 'function'
+      AWS_REGION: 'us-east-1'
+      AWS_ACCESS_KEY_ID: 'local' # the emulator ignores credentials, but the SDK requires some
+      AWS_SECRET_ACCESS_KEY: 'local'
     depends_on:
       - postgres
       - temporal
+      - vendors
     restart: on-failure:10
+  # The external vendors, as an AWS Lambda container image. Locally it runs a
+  # concurrent Invoke-API server instead of the single-invocation emulator.
+  vendors:
+    build: ./lambdas/vendors
+    entrypoint: ['node', '/var/task/local-server.js']
+    environment:
+      DATABASE_URL: 'postgres://user:password@postgres:5432/workflows'
+      PG_POOL_MAX: '10'
+      # Failure injection for demos (see lambdas/vendors/index.ts):
+      MOCK_FAILURE_RATE: '${MOCK_FAILURE_RATE:-0}' # 0-1, fails before doing any work
+      MOCK_FAILING_SYSTEMS: '${MOCK_FAILING_SYSTEMS:-}' # e.g. "github,slack"
+      MOCK_LOST_RESPONSE_RATE: '${MOCK_LOST_RESPONSE_RATE:-0}' # 0-1, work done but response lost
+    depends_on:
+      - postgres

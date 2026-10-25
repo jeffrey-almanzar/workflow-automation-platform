@@ -29,16 +29,17 @@ This project covers several key concepts, including distributed workflow orchest
 ## Architecture
 
 ```
-[Client] --> [NestJS API] --> [Temporal Service] --> [AWS Lambda]
-                     |                  |
-                  [PostgreSQL]        [Worker]
+[Client] --> [NestJS API] --> [Temporal Service] <--polls-- [Worker] --invokes--> [AWS Lambda: vendors]
+                  |                                             |                        |
+                  +--------------- reads ----> [PostgreSQL] <---+ writes                 | own schema
+                                                    ^-------------------------------------+
 ```
-- **Client**: Interacts with the API to start and monitor workflows.
-- **NestJS API**: Exposes REST endpoints to manage workflows; talks to the Temporal Service to start and monitor them.
+- **Client**: Interacts with the API to start, advance and monitor workflows.
+- **NestJS API**: Exposes REST endpoints; starts/signals/queries workflows through Temporal and reads employee records and the audit log from PostgreSQL.
 - **Temporal Service**: Orchestrates workflow execution, manages state, and guarantees execution.
-- **AWS Lambda**: Runs serverless functions as part of the workflows, enabling efficient scalability.
-- **PostgreSQL**: Stores persistent workflow data and results.
-- **Worker**: Executes the tasks defined in the workflows, interacting with the Temporal Service.
+- **Worker**: Executes the workflow and activity code. Activities write to PostgreSQL and call the vendors Lambda.
+- **AWS Lambda (vendors)**: Simulates the external SaaS vendors (e-signature, email, Slack, GitHub, laptop, payroll), with its own state and idempotency-key handling, like a real vendor API.
+- **PostgreSQL**: Our system of record (employees, audit log), the vendors' simulated state (separate `vendors` schema), and Temporal's own persistence (separate databases).
 
 ## How it works
 
@@ -88,23 +89,28 @@ POST /offboardings ──▶ offboardingWorkflow(employeeId, resources from onbo
 | `POST /onboardings/:id/cancellation` | Sends the `cancelOnboarding` signal with `{ "reason": "..." }` and rolls back everything done so far. |
 | `POST /offboardings` | `{ "employeeId", "reason", "revokeAccessAt"? }`. Only for a completed onboarding (`409` otherwise, `404` if none). |
 | `GET /offboardings/:id` | Live offboarding progress. |
+| `GET /employees/:employeeId` | The employee record from PostgreSQL plus its full audit trail across onboarding and offboarding. |
 
 Signals to an unknown onboarding return `404`; to one that already finished, `409`.
 
-The external systems are mocked for now ([src/activities.ts](src/activities.ts)), with realistic latency, optional random failures, and optional permanent outages per system.
+The external vendors are simulated by an AWS Lambda function ([lambdas/vendors/index.ts](lambdas/vendors/index.ts)) with realistic latency and injectable failures: random errors, permanent outages per system, and lost responses.
 
 ### The moving pieces
 
 | File | Role |
 | --- | --- |
 | [src/main.ts](src/main.ts) | Boots the NestJS app, enables request validation, and listens on port 3000. |
-| [src/app.module.ts](src/app.module.ts) | Root module; wires `OnboardingController` and `TemporalService` together. |
+| [src/app.module.ts](src/app.module.ts) | Root module; wires the controllers, `TemporalService` and `DatabaseService` together. |
 | [src/onboarding.controller.ts](src/onboarding.controller.ts) | HTTP layer and request DTOs for `/onboardings` (start, progress, signature, start date, cancellation). |
 | [src/offboarding.controller.ts](src/offboarding.controller.ts) | HTTP layer and request DTO for `/offboardings`. |
+| [src/employees.controller.ts](src/employees.controller.ts) / [src/database.service.ts](src/database.service.ts) | `GET /employees/:id`: employee record and audit trail from PostgreSQL. |
 | [src/temporal.service.ts](src/temporal.service.ts) | Temporal **client**: starts, signals and queries onboarding workflows; maps Temporal errors to HTTP 404/409. |
 | [src/shared.ts](src/shared.ts) | Types, task queue name, default timings, and the query/signal definitions shared by the API and the worker. |
 | [src/workflows.ts](src/workflows.ts) | The orchestration logic (`onboardingWorkflow`, `offboardingWorkflow`), executed by the worker, not by the NestJS process. |
-| [src/activities.ts](src/activities.ts) | Activities: one per external-system operation, plus the matching undo operation for each, plus notifications. |
+| [src/activities.ts](src/activities.ts) | Activities: one per external-system operation, plus the matching undo operation for each, plus notifications. Each writes to PostgreSQL and/or calls a vendor, and records an audit event. |
+| [src/db.ts](src/db.ts) | PostgreSQL pool and idempotent schema migration (`employees`, `audit_log`), shared by API and worker. |
+| [src/vendors.ts](src/vendors.ts) | Invokes the vendors Lambda through the AWS SDK and derives the idempotency key for each call. |
+| [lambdas/vendors/](lambdas/vendors/) | The vendors Lambda: handler, container image, and a local Invoke-API server for docker-compose. |
 | [src/worker.ts](src/worker.ts) | A separate Node process that polls Temporal for work and executes `workflows.ts`/`activities.ts`. |
 
 Two independent Node processes come out of this codebase:
@@ -162,6 +168,25 @@ Design decisions worth calling out:
 
 Offboarding reuses the same undo activities. Tearing down an employee is the same set of operations as rolling back a cancelled hire, so it starts from the resource IDs in the completed onboarding's result.
 
+### Exactly-once side effects: idempotency keys
+
+Temporal retries a failed activity automatically, which raises the classic distributed-systems problem: what if the call *succeeded* at the vendor but the response was lost (timeout, connection reset)? A naive retry would create a second email account (`ana.lopez2@` next to the orphaned `ana.lopez@`), a second laptop order, a second payroll record.
+
+The fix spans both sides of the call:
+
+- **The caller sends an idempotency key** that is identical on every retry of an activity call and different for any other call: `<workflow run ID>:<activity ID>` ([src/vendors.ts](src/vendors.ts)). A rehire runs a new workflow run, so it correctly gets new keys.
+- **The vendor stores the key with its response in the same transaction as the side effect** ([lambdas/vendors/index.ts](lambdas/vendors/index.ts)). A repeated key returns the stored response (`replayed: true`) without doing the work again. If two identical requests race, the unique key lets only one commit.
+- **Our own writes are idempotent too**: the employee record is an upsert, and audit rows are keyed by activity call (`ON CONFLICT DO NOTHING`), so a retried activity never writes a second audit entry.
+- **Retries happen in exactly one place.** The AWS SDK's own retries are disabled (`maxAttempts: 1`); Temporal's retry policy is the only one, so attempts aren't multiplied and every retry is visible in the workflow history.
+
+This is testable: `MOCK_LOST_RESPONSE_RATE=0.6` makes the vendor commit the work and then drop the response 60% of the time. Onboardings still end with exactly one resource per system, and the audit log marks which ones were `replayed`.
+
+### AWS Lambda locally
+
+The vendors function is a container-image Lambda ([lambdas/vendors/Dockerfile](lambdas/vendors/Dockerfile)) built on the official `public.ecr.aws/lambda/nodejs:22` base image, so the same image deploys to AWS Lambda unchanged. The worker calls it with the AWS SDK's `InvokeCommand`; locally, `LAMBDA_ENDPOINT` points the SDK at the container instead of AWS.
+
+The base image's Runtime Interface Emulator only handles one invocation at a time and crashes on concurrent ones (real Lambda scales out to more instances instead). Since provisioning calls vendors in parallel, docker-compose runs the image with a small server ([lambdas/vendors/local-server.ts](lambdas/vendors/local-server.ts)) that exposes the same Invoke API and calls the same handler concurrently.
+
 ### Request lifecycle: checking progress
 
 1. A client sends `GET /onboardings/:id`.
@@ -177,17 +202,17 @@ Workflow code has to be deterministic (same inputs always produce the same seque
 
 ### Local topology
 
-Running `docker compose up` starts five containers that map directly onto the pieces above:
+Running `docker compose up` starts six containers that map directly onto the pieces above:
 
 ```
-app (NestJS, :3000) ──Temporal client──▶ temporal (:7233) ◀──polls── worker
-                                           │       ▲
-                                  postgres (:5432)  temporal-ui (:8080)
+app (NestJS, :3000) ──Temporal client──▶ temporal (:7233) ◀──polls── worker ──Lambda Invoke API──▶ vendors
+       │                                   │       ▲                    │                            │
+       └──────────────────────────▶ postgres (:5432)  temporal-ui (:8080) ◀─────────────────────────┘
 ```
 
 ## Local environment (cloud simulation)
 
-To emulate the project's cloud environment, we use Docker Compose to spin up the required services locally. This includes Temporal, its Web UI, PostgreSQL, the NestJS API and the worker.
+To emulate the project's cloud environment, we use Docker Compose to spin up the required services locally. This includes Temporal, its Web UI, PostgreSQL, the NestJS API, the worker, and the vendors Lambda.
 
 1. Run `docker compose up --build` in the root directory (`docker compose down` to stop).
 2. The API is available at `http://localhost:3000`, Temporal at `localhost:7233`, and the Temporal Web UI at `http://localhost:8080`, where you can inspect every workflow's event history.
@@ -212,14 +237,18 @@ To emulate the project's cloud environment, we use Docker Compose to spin up the
      docker compose up -d app
    ```
    Then stop the worker (`docker compose stop worker`) while a contract is unsigned, wait past the deadlines, and start it again: the reminder and escalation fire as soon as it reconnects.
-8. To watch retries happen, make the mocked systems fail randomly and restart the worker:
-   `MOCK_FAILURE_RATE=0.5 docker compose up -d worker`. Failed attempts appear as retries in the Web UI.
+8. To watch retries happen, make the vendors fail randomly:
+   `MOCK_FAILURE_RATE=0.5 docker compose up -d vendors`. Failed attempts appear as retries in the Web UI.
 9. To see the saga roll back, cancel an onboarding at any stage:
    `curl -X POST localhost:3000/onboardings/onboarding-E1001/cancellation -H 'Content-Type: application/json' -d '{"reason":"Offer withdrawn"}'`
    or simulate a permanent outage, so provisioning fails and everything else is undone:
-   `MOCK_FAILING_SYSTEMS=GitHub docker compose up -d worker`
+   `MOCK_FAILING_SYSTEMS=github docker compose up -d vendors`
 10. Once an onboarding has completed, offboard the employee:
     `curl -X POST localhost:3000/offboardings -H 'Content-Type: application/json' -d '{"employeeId":"E1001","reason":"Resigned"}'`
+11. See the employee record and full audit trail: `curl localhost:3000/employees/E1001`
+12. To see idempotency at work, make the vendors lose responses after doing the work:
+    `MOCK_LOST_RESPONSE_RATE=0.6 docker compose up -d vendors`, run an onboarding, then check that each system still has exactly one resource:
+    `docker compose exec postgres psql -U user -d workflows -c "SELECT system, count(*) FROM vendors.resources WHERE employee_id='E1001' GROUP BY system"`
 
 ## Cloud deployment
 

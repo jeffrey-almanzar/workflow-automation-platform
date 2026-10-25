@@ -245,7 +245,7 @@ export async function onboardingWorkflow(
     for (;;) {
       if (startDateChanged) {
         startDateChanged = false;
-        await acts.notifyStartDateChanged(hire, startDate);
+        await acts.notifyStartDateChanged(hire, startDate, resources.laptop);
       }
       const remaining = welcomeEmailAt().getTime() - Date.now();
       if (remaining <= 0) break;
@@ -254,6 +254,7 @@ export async function onboardingWorkflow(
 
     await runStep('welcome', () => acts.sendWelcomeEmail({ ...hire, startDate }, resources.email!));
     checkpoint();
+    await acts.activateEmployee(hire.employeeId);
 
     status = 'COMPLETED';
     return progress();

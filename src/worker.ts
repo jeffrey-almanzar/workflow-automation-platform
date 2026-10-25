@@ -4,9 +4,12 @@
 
 import { NativeConnection, Worker } from '@temporalio/worker';
 import * as activities from './activities';
+import { migrate } from './db';
 import { TASK_QUEUE } from './shared';
 
 async function run() {
+  await migrate();
+
   const connection = await NativeConnection.connect({
     address: process.env.TEMPORAL_ADDRESS ?? 'temporal:7233',
   });

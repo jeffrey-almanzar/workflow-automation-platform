@@ -2,109 +2,135 @@
 // Unlike workflow code, activities can do I/O
 // (HTTP calls, DB, whatever) and Temporal automatically retries them on failure.
 //
-// For now every external system is mocked. Each call has realistic latency and,
-// when MOCK_FAILURE_RATE is set (e.g. 0.3), fails randomly so you can watch
-// Temporal retry it in the UI. MOCK_FAILING_SYSTEMS (e.g. "GitHub,Slack") makes
-// those systems fail every call, to reproduce permanent outages.
-// Each activity returns the ID of the resource it created, which the workflow
-// keeps for compensation.
+// Two kinds of side effects happen here:
+//  - Our own PostgreSQL (src/db.ts): the employee record and the audit log.
+//  - External vendors, reached through the vendors Lambda (src/vendors.ts).
+// Both are safe to retry: database writes are upserts / ON CONFLICT DO NOTHING,
+// and every vendor call carries an idempotency key that is stable across retries.
+// Each create activity returns the ID of the resource it created, which the
+// workflow keeps for compensation and offboarding.
 
-import { log } from '@temporalio/activity';
+import { Context, log } from '@temporalio/activity';
+import { pool } from './db';
 import type { NewHire } from './shared';
+import { VendorOperation, VendorSystem, callVendor, idempotencyKey } from './vendors';
 
-const FAILURE_RATE = Number(process.env.MOCK_FAILURE_RATE ?? 0);
-const FAILING_SYSTEMS = new Set(
-  (process.env.MOCK_FAILING_SYSTEMS ?? '')
-    .split(',')
-    .map((name) => name.trim())
-    .filter(Boolean),
-);
+async function audit(employeeId: string, event: string, details: Record<string, unknown> = {}): Promise<void> {
+  // Keyed by activity call, so a retried activity never writes a second row.
+  const key = idempotencyKey();
+  await pool.query(
+    `INSERT INTO audit_log (employee_id, workflow_id, event, details, idempotency_key)
+     VALUES ($1, $2, $3, $4, $5) ON CONFLICT (idempotency_key) DO NOTHING`,
+    [employeeId, Context.current().info.workflowExecution!.workflowId, event, details, key],
+  );
+}
 
-async function simulateCall(system: string, minMs = 200, maxMs = 1500): Promise<void> {
-  const latency = minMs + Math.random() * (maxMs - minMs);
-  await new Promise((resolve) => setTimeout(resolve, latency));
-  if (FAILING_SYSTEMS.has(system) || Math.random() < FAILURE_RATE) {
-    throw new Error(`${system} is temporarily unavailable`);
+async function vendorStep(
+  employeeId: string,
+  event: string,
+  system: VendorSystem,
+  operation: VendorOperation,
+  payload: Record<string, string | undefined> = {},
+): Promise<string> {
+  const { resourceId, replayed } = await callVendor(system, operation, { employeeId, ...payload });
+  if (replayed) {
+    // An earlier attempt succeeded at the vendor but its response never arrived.
+    log.warn('Vendor returned stored response; duplicate prevented', { system, operation, resourceId });
   }
+  await audit(employeeId, event, { system, resourceId, replayed });
+  log.info(event, { employeeId, system, resourceId });
+  return resourceId;
 }
 
-function companyEmail(hire: NewHire): string {
-  const local = hire.fullName
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[^a-z\s]/g, '')
-    .trim()
-    .split(/\s+/)
-    .join('.');
-  return `${local}@company.com`;
-}
+// --- Forward steps ---
 
 export async function createHrRecord(hire: NewHire): Promise<string> {
-  await simulateCall('HR system');
+  // Upsert: safe to retry, and a rehire reuses the existing row.
+  await pool.query(
+    `INSERT INTO employees (employee_id, full_name, personal_email, role, start_date, status)
+     VALUES ($1, $2, $3, $4, $5, 'ONBOARDING')
+     ON CONFLICT (employee_id) DO UPDATE SET
+       full_name = EXCLUDED.full_name, personal_email = EXCLUDED.personal_email, role = EXCLUDED.role,
+       start_date = EXCLUDED.start_date, company_email = NULL, status = 'ONBOARDING', updated_at = now()`,
+    [hire.employeeId, hire.fullName, hire.personalEmail, hire.role, hire.startDate],
+  );
+  await audit(hire.employeeId, 'HR_RECORD_CREATED', { role: hire.role, startDate: hire.startDate });
   log.info('HR record created', { employeeId: hire.employeeId });
   return `hr-${hire.employeeId}`;
 }
 
 export async function createEmailAccount(hire: NewHire): Promise<string> {
-  await simulateCall('Email provider');
-  const email = companyEmail(hire);
-  log.info('Email account created', { email });
+  const email = await vendorStep(hire.employeeId, 'EMAIL_ACCOUNT_CREATED', 'email', 'create', {
+    fullName: hire.fullName,
+  });
+  await pool.query('UPDATE employees SET company_email = $2, updated_at = now() WHERE employee_id = $1', [
+    hire.employeeId,
+    email,
+  ]);
   return email;
 }
 
-export async function createSlackAccount(hire: NewHire): Promise<string> {
-  await simulateCall('Slack');
-  log.info('Slack account created', { employeeId: hire.employeeId });
-  return `slack-U${hire.employeeId}`;
+export function createSlackAccount(hire: NewHire): Promise<string> {
+  return vendorStep(hire.employeeId, 'SLACK_ACCOUNT_CREATED', 'slack', 'create');
 }
 
-export async function grantGithubAccess(hire: NewHire): Promise<string> {
-  await simulateCall('GitHub');
-  log.info('GitHub org invite sent', { employeeId: hire.employeeId });
-  return `gh-invite-${hire.employeeId}`;
+export function grantGithubAccess(hire: NewHire): Promise<string> {
+  return vendorStep(hire.employeeId, 'GITHUB_ACCESS_GRANTED', 'github', 'create');
 }
 
-export async function orderLaptop(hire: NewHire): Promise<string> {
-  // Vendor APIs are the slowest system in the chain.
-  await simulateCall('Laptop vendor', 1000, 3000);
-  log.info('Laptop ordered', { employeeId: hire.employeeId, role: hire.role });
-  return `order-${hire.employeeId}`;
+export function orderLaptop(hire: NewHire): Promise<string> {
+  return vendorStep(hire.employeeId, 'LAPTOP_ORDERED', 'laptop', 'create', {
+    role: hire.role,
+    deliverBy: hire.startDate,
+  });
 }
 
-export async function enrollInPayroll(hire: NewHire): Promise<string> {
-  await simulateCall('Payroll');
-  log.info('Enrolled in payroll', { employeeId: hire.employeeId, startDate: hire.startDate });
-  return `payroll-${hire.employeeId}`;
+export function enrollInPayroll(hire: NewHire): Promise<string> {
+  return vendorStep(hire.employeeId, 'PAYROLL_ENROLLED', 'payroll', 'create', { startDate: hire.startDate });
+}
+
+export async function activateEmployee(employeeId: string): Promise<void> {
+  await pool.query("UPDATE employees SET status = 'ACTIVE', updated_at = now() WHERE employee_id = $1", [employeeId]);
+  await audit(employeeId, 'EMPLOYEE_ACTIVATED');
 }
 
 // --- Human-in-the-loop notifications ---
 
-export async function sendContract(hire: NewHire): Promise<string> {
-  await simulateCall('E-signature service');
-  log.info('Contract sent for signature', { employeeId: hire.employeeId, to: hire.personalEmail });
-  return `envelope-${hire.employeeId}`;
+export function sendContract(hire: NewHire): Promise<string> {
+  return vendorStep(hire.employeeId, 'CONTRACT_SENT', 'esignature', 'create', { to: hire.personalEmail });
 }
 
 export async function sendContractReminder(hire: NewHire): Promise<void> {
-  await simulateCall('Email provider', 100, 500);
-  log.info('Contract reminder sent', { employeeId: hire.employeeId, to: hire.personalEmail });
+  await vendorStep(hire.employeeId, 'CONTRACT_REMINDER_SENT', 'email', 'send', {
+    to: hire.personalEmail,
+    template: 'contract-reminder',
+  });
 }
 
 export async function escalateToHr(employeeId: string, reason: string): Promise<void> {
-  await simulateCall('HR ticketing', 100, 500);
+  await audit(employeeId, 'ESCALATED_TO_HR', { reason });
   log.warn('Escalated to HR', { employeeId, reason });
 }
 
-export async function notifyStartDateChanged(hire: NewHire, newStartDate: string): Promise<void> {
-  // Tells the laptop vendor and IT so delivery and account activation line up.
-  await simulateCall('Laptop vendor', 200, 800);
-  log.info('Start date change propagated', { employeeId: hire.employeeId, newStartDate });
+export async function notifyStartDateChanged(hire: NewHire, newStartDate: string, laptopOrderId?: string): Promise<void> {
+  await pool.query('UPDATE employees SET start_date = $2, updated_at = now() WHERE employee_id = $1', [
+    hire.employeeId,
+    newStartDate,
+  ]);
+  // Reschedule delivery so the laptop arrives in time for the new date.
+  await vendorStep(hire.employeeId, 'START_DATE_CHANGED', 'laptop', 'update', {
+    resourceId: laptopOrderId,
+    deliverBy: newStartDate,
+  });
 }
 
-export async function sendWelcomeEmail(hire: NewHire, companyEmail: string): Promise<string> {
-  await simulateCall('Email provider', 100, 500);
-  log.info('Welcome email sent', { to: hire.personalEmail, companyEmail, startDate: hire.startDate });
-  return `welcome-${hire.employeeId}`;
+export function sendWelcomeEmail(hire: NewHire, companyEmail: string): Promise<string> {
+  return vendorStep(hire.employeeId, 'WELCOME_EMAIL_SENT', 'email', 'send', {
+    to: hire.personalEmail,
+    template: 'welcome',
+    companyEmail,
+    startDate: hire.startDate,
+  });
 }
 
 // --- Undo operations ---
@@ -112,41 +138,37 @@ export async function sendWelcomeEmail(hire: NewHire, companyEmail: string): Pro
 // Each one must be idempotent: Temporal may retry it, so "already gone" is success.
 
 export async function archiveHrRecord(employeeId: string, hrRecordId: string): Promise<void> {
-  await simulateCall('HR system');
+  await pool.query("UPDATE employees SET status = 'ARCHIVED', updated_at = now() WHERE employee_id = $1", [
+    employeeId,
+  ]);
+  await audit(employeeId, 'HR_RECORD_ARCHIVED', { hrRecordId });
   log.info('HR record archived', { employeeId, hrRecordId });
 }
 
 export async function voidContract(employeeId: string, envelopeId: string): Promise<void> {
-  await simulateCall('E-signature service');
-  log.info('Contract voided', { employeeId, envelopeId });
+  await vendorStep(employeeId, 'CONTRACT_VOIDED', 'esignature', 'deactivate', { resourceId: envelopeId });
 }
 
 export async function deactivateEmailAccount(employeeId: string, email: string): Promise<void> {
-  await simulateCall('Email provider');
-  log.info('Email account deactivated', { employeeId, email });
+  await vendorStep(employeeId, 'EMAIL_ACCOUNT_DEACTIVATED', 'email', 'deactivate', { resourceId: email });
 }
 
 export async function deactivateSlackAccount(employeeId: string, slackUserId: string): Promise<void> {
-  await simulateCall('Slack');
-  log.info('Slack account deactivated', { employeeId, slackUserId });
+  await vendorStep(employeeId, 'SLACK_ACCOUNT_DEACTIVATED', 'slack', 'deactivate', { resourceId: slackUserId });
 }
 
 export async function revokeGithubAccess(employeeId: string, inviteId: string): Promise<void> {
-  await simulateCall('GitHub');
-  log.info('GitHub access revoked', { employeeId, inviteId });
+  await vendorStep(employeeId, 'GITHUB_ACCESS_REVOKED', 'github', 'deactivate', { resourceId: inviteId });
 }
 
 export async function cancelLaptopOrder(employeeId: string, orderId: string): Promise<void> {
-  await simulateCall('Laptop vendor', 1000, 3000);
-  log.info('Laptop order cancelled', { employeeId, orderId });
+  await vendorStep(employeeId, 'LAPTOP_ORDER_CANCELLED', 'laptop', 'deactivate', { resourceId: orderId });
 }
 
 export async function removeFromPayroll(employeeId: string, payrollId: string): Promise<void> {
-  await simulateCall('Payroll');
-  log.info('Removed from payroll', { employeeId, payrollId });
+  await vendorStep(employeeId, 'PAYROLL_REMOVED', 'payroll', 'deactivate', { resourceId: payrollId });
 }
 
 export async function requestLaptopReturn(employeeId: string, orderId: string): Promise<void> {
-  await simulateCall('Laptop vendor', 500, 1500);
-  log.info('Laptop return shipping label sent', { employeeId, orderId });
+  await vendorStep(employeeId, 'LAPTOP_RETURN_REQUESTED', 'laptop', 'send', { resourceId: orderId });
 }
