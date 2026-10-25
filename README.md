@@ -46,20 +46,34 @@ This section walks through what actually runs today in `src/`, end to end.
 
 ### The use case: employee onboarding
 
-When someone is hired, several independent systems must be set up: an HR record, a company email account, Slack, GitHub (engineers only), a laptop order and payroll enrollment. `onboardingWorkflow` orchestrates all of them:
+When someone is hired, a contract must be signed and several independent systems set up (HR record, company email, Slack, GitHub for engineers, a laptop order, payroll) before a welcome email goes out just before day one. The process spans weeks and depends on humans, which is exactly what `onboardingWorkflow` orchestrates:
 
 ```
 POST /onboardings ──▶ onboardingWorkflow(newHire)
-  1. createHrRecord                       (everything else depends on it)
-  2. in parallel:
+  1. createHrRecord                        (everything else depends on it)
+  2. sendContract, then wait for the contractSigned signal
+       unsigned after 3 days  → sendContractReminder      (durable timer)
+       unsigned 4 days later  → escalateToHr, keep waiting
+  3. in parallel:
        createEmailAccount ┐
        createSlackAccount │ each retried independently
        grantGithubAccess  │ (1s, 2s, 4s, 8s backoff, 5 attempts)
        orderLaptop        │
        enrollInPayroll    ┘
-  3. COMPLETED, or FAILED if any step exhausted its retries
-GET /onboardings/:id ──▶ progress query (live step-by-step state)
+  4. sleep until 1 day before the start date (may be weeks)
+       updateStartDate signal → notifyStartDateChanged, timer recomputed
+  5. sendWelcomeEmail → COMPLETED
+     (FAILED if any step exhausted its retries)
 ```
+
+| Endpoint | What it does |
+| --- | --- |
+| `POST /onboardings` | Starts an onboarding (`202`, or `409` if one exists for that employee). |
+| `GET /onboardings/:id` | Live progress: phase, % complete, per-step status, contract state, scheduled welcome time. |
+| `POST /onboardings/:id/contract-signature` | Sends the `contractSigned` signal (in production, the e-signature provider's webhook). Idempotent. |
+| `PATCH /onboardings/:id/start-date` | Sends the `updateStartDate` signal with `{ "startDate": "..." }`. |
+
+Signals to an unknown onboarding return `404`; to one that already finished, `409`.
 
 The external systems are mocked for now ([src/activities.ts](src/activities.ts)), with realistic latency and optional random failures.
 
@@ -70,10 +84,10 @@ The external systems are mocked for now ([src/activities.ts](src/activities.ts))
 | [src/main.ts](src/main.ts) | Boots the NestJS app, enables request validation, and listens on port 3000. |
 | [src/app.module.ts](src/app.module.ts) | Root module; wires `OnboardingController` and `TemporalService` together. |
 | [src/onboarding.controller.ts](src/onboarding.controller.ts) | HTTP layer and request DTO: `POST /onboardings` and `GET /onboardings/:id`. |
-| [src/temporal.service.ts](src/temporal.service.ts) | Temporal **client**: starts onboarding workflows and reads their state; maps Temporal errors to HTTP 404/409. |
-| [src/shared.ts](src/shared.ts) | Types, task queue name and the `progress` query definition shared by the API and the worker. |
+| [src/temporal.service.ts](src/temporal.service.ts) | Temporal **client**: starts, signals and queries onboarding workflows; maps Temporal errors to HTTP 404/409. |
+| [src/shared.ts](src/shared.ts) | Types, task queue name, default timings, and the query/signal definitions shared by the API and the worker. |
 | [src/workflows.ts](src/workflows.ts) | The orchestration logic (`onboardingWorkflow`), executed by the worker, not by the NestJS process. |
-| [src/activities.ts](src/activities.ts) | Activities: one per external system (HR, email, Slack, GitHub, laptop vendor, payroll). |
+| [src/activities.ts](src/activities.ts) | Activities: one per external system (HR, e-signature, email, Slack, GitHub, laptop vendor, payroll) plus notifications. |
 | [src/worker.ts](src/worker.ts) | A separate Node process that polls Temporal for work and executes `workflows.ts`/`activities.ts`. |
 
 Two independent Node processes come out of this codebase:
@@ -86,12 +100,28 @@ They never call each other directly; Temporal is the broker in between. This sep
 
 1. A client sends `POST /onboardings` with the new hire's data. NestJS's `ValidationPipe` rejects malformed bodies with a 400 before anything reaches Temporal.
 2. `OnboardingController.start()` delegates to `TemporalService.startOnboarding()`.
-3. `TemporalService` calls `client.workflow.start('onboardingWorkflow', { taskQueue: 'onboarding', workflowId: 'onboarding-<employeeId>', args: [hire] })`. This only asks the Temporal **server** to record "please run this workflow" and returns immediately, so the API answers `202 Accepted` with the `onboardingId`. No business logic has executed yet.
+3. `TemporalService` calls `client.workflow.start('onboardingWorkflow', { taskQueue: 'onboarding', workflowId: 'onboarding-<employeeId>', args: [hire, timings] })`. This only asks the Temporal **server** to record "please run this workflow" and returns immediately, so the API answers `202 Accepted` with the `onboardingId`. No business logic has executed yet.
 4. Because the workflow ID is derived from the employee ID, Temporal rejects a second onboarding for the same person, which the API returns as `409 Conflict`. Deduplication comes for free, with no extra table or lock.
 5. The `worker`, polling the `onboarding` task queue, picks up the task and runs `onboardingWorkflow`.
-6. The workflow schedules `createHrRecord`, then the remaining activities in parallel. Temporal dispatches each as an *activity task*; a failed attempt is retried with exponential backoff without the workflow code doing anything.
+6. The workflow creates the HR record, sends the contract and waits for it to be signed (see below), then schedules the provisioning activities in parallel. Temporal dispatches each as an *activity task*; a failed attempt is retried with exponential backoff without the workflow code doing anything.
 7. Each activity returns the ID of what it created (email address, order number, ...). The workflow keeps these, since they will be needed to undo steps when compensation is added.
-8. The workflow completes, or fails if a step exhausts its retries.
+8. The workflow sleeps until the welcome email is due, sends it and completes, or fails if a step exhausts its retries.
+
+### Waiting on humans: signals and durable timers
+
+The contract and start-date phases are where Temporal earns its place. A plain backend would need a status table, a cron job scanning for overdue contracts, and careful locking. Here it is a few lines of ordinary code:
+
+```ts
+if (!(await condition(signed, '3 days'))) {   // resolves early if the signal arrives
+  await acts.sendContractReminder(hire);
+  ...
+}
+```
+
+- **Signals** (`contractSigned`, `updateStartDate`) are delivered to the running workflow and persisted in its history. Handlers only record the event; the main flow decides what to do with it.
+- **Timers** (`condition(..., timeout)`) are stored by the Temporal server, not held in worker memory. Nothing runs while waiting, and the wait survives worker crashes and redeploys: if the worker is down when a timer expires, the workflow continues as soon as a worker reconnects.
+- **Changing the start date** wakes the sleeping workflow, which propagates the change and recomputes the timer from the new date.
+- **Timings are workflow input**, not config read inside the workflow. They are recorded in history, so changing them later only affects new onboardings, never ones already in flight.
 
 ### Request lifecycle: checking progress
 
@@ -100,6 +130,7 @@ They never call each other directly; Temporal is the broker in between. This sep
    - `describe()` asks the Temporal **server** for the execution status (`RUNNING`, `COMPLETED`, `FAILED`) and timestamps.
    - `query(progressQuery)` asks the **workflow itself** for its in-memory state: which steps are pending, running, done or failed, plus the created resource IDs. There is no separate status table to keep in sync.
 3. An unknown ID returns `404 Not Found`.
+4. If no worker answers the query within 3 seconds (e.g. all workers are down), the endpoint still returns the server-side status with `progress: null` instead of hanging. The workflow itself is unaffected.
 
 ### Why a separate worker process?
 
@@ -133,7 +164,16 @@ To emulate the project's cloud environment, we use Docker Compose to spin up the
    # → 202 {"onboardingId":"onboarding-E1001"}
    ```
 4. Check its progress: `curl localhost:3000/onboardings/onboarding-E1001`
-5. To watch retries happen, make the mocked systems fail randomly and restart the worker:
+5. Sign the contract so provisioning can start:
+   `curl -X POST localhost:3000/onboardings/onboarding-E1001/contract-signature`
+6. Move the start date: `curl -X PATCH localhost:3000/onboardings/onboarding-E1001/start-date -H 'Content-Type: application/json' -d '{"startDate":"2026-11-23"}'`
+7. To watch the timers fire without waiting days, shorten them (any [`ms`](https://github.com/vercel/ms)-style duration) and use a start date a minute or two away:
+   ```bash
+   CONTRACT_REMINDER_DELAY="15 seconds" CONTRACT_ESCALATION_DELAY="15 seconds" WELCOME_LEAD_TIME="10 seconds" \
+     docker compose up -d app
+   ```
+   Then stop the worker (`docker compose stop worker`) while a contract is unsigned, wait past the deadlines, and start it again: the reminder and escalation fire as soon as it reconnects.
+8. To watch retries happen, make the mocked systems fail randomly and restart the worker:
    `MOCK_FAILURE_RATE=0.5 docker compose up -d worker`. Failed attempts appear as retries in the Web UI.
 
 ## Cloud deployment

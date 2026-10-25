@@ -35,6 +35,11 @@ services:
       - '3000:3000'
     environment:
       TEMPORAL_ADDRESS: 'temporal:7233'
+      # Shorten the human-step timers for local demos, e.g. CONTRACT_REMINDER_DELAY="30 seconds".
+      # Empty = production defaults (3 days / 4 more days / 1 day before start).
+      CONTRACT_REMINDER_DELAY: '${CONTRACT_REMINDER_DELAY:-}'
+      CONTRACT_ESCALATION_DELAY: '${CONTRACT_ESCALATION_DELAY:-}'
+      WELCOME_LEAD_TIME: '${WELCOME_LEAD_TIME:-}'
     depends_on:
       - postgres
       - temporal

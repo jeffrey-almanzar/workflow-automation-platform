@@ -68,3 +68,33 @@ export async function enrollInPayroll(hire: NewHire): Promise<string> {
   log.info('Enrolled in payroll', { employeeId: hire.employeeId, startDate: hire.startDate });
   return `payroll-${hire.employeeId}`;
 }
+
+// --- Human-in-the-loop notifications ---
+
+export async function sendContract(hire: NewHire): Promise<string> {
+  await simulateCall('E-signature service');
+  log.info('Contract sent for signature', { employeeId: hire.employeeId, to: hire.personalEmail });
+  return `envelope-${hire.employeeId}`;
+}
+
+export async function sendContractReminder(hire: NewHire): Promise<void> {
+  await simulateCall('Email provider', 100, 500);
+  log.info('Contract reminder sent', { employeeId: hire.employeeId, to: hire.personalEmail });
+}
+
+export async function escalateToHr(hire: NewHire, reason: string): Promise<void> {
+  await simulateCall('HR ticketing', 100, 500);
+  log.warn('Escalated to HR', { employeeId: hire.employeeId, reason });
+}
+
+export async function notifyStartDateChanged(hire: NewHire, newStartDate: string): Promise<void> {
+  // Tells the laptop vendor and IT so delivery and account activation line up.
+  await simulateCall('Laptop vendor', 200, 800);
+  log.info('Start date change propagated', { employeeId: hire.employeeId, newStartDate });
+}
+
+export async function sendWelcomeEmail(hire: NewHire, companyEmail: string): Promise<string> {
+  await simulateCall('Email provider', 100, 500);
+  log.info('Welcome email sent', { to: hire.personalEmail, companyEmail, startDate: hire.startDate });
+  return `welcome-${hire.employeeId}`;
+}

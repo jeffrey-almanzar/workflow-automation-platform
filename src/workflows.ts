@@ -1,16 +1,25 @@
 // Workflow definition. This code runs inside Temporal's "workflow sandbox":
 // it must be deterministic (no direct I/O, no raw Date.now(), etc.).
 // To do real work, it delegates to activities via proxyActivities.
+// (Date.now() / new Date() ARE safe here: the sandbox replaces them with the
+// time recorded in history, so they return the same value on replay.)
 
-import { ApplicationFailure, proxyActivities, setHandler } from '@temporalio/workflow';
+import { ApplicationFailure, condition, proxyActivities, setHandler } from '@temporalio/workflow';
+import type { Duration } from '@temporalio/common';
+import ms from 'ms';
 import type * as activities from './activities';
 import {
+  ContractState,
+  DEFAULT_TIMINGS,
   NewHire,
   OnboardingProgress,
   OnboardingStatus,
+  OnboardingTimings,
   StepName,
   StepStatus,
+  contractSignedSignal,
   progressQuery,
+  updateStartDateSignal,
 } from './shared';
 
 const acts = proxyActivities<typeof activities>({
@@ -24,19 +33,32 @@ const acts = proxyActivities<typeof activities>({
   },
 });
 
-export async function onboardingWorkflow(hire: NewHire): Promise<OnboardingProgress> {
+export async function onboardingWorkflow(
+  hire: NewHire,
+  timings: Partial<OnboardingTimings> = {},
+): Promise<OnboardingProgress> {
+  const t: OnboardingTimings = { ...DEFAULT_TIMINGS, ...timings };
+
   // Workflow state lives in plain variables. Temporal rebuilds it by replaying
   // history, so it survives worker crashes without being stored anywhere else.
-  let status: OnboardingStatus = 'PROVISIONING';
+  let status: OnboardingStatus = 'AWAITING_CONTRACT';
+  let startDate = hire.startDate;
+  let startDateChanged = false;
+  const contract: ContractState = { sentAt: null, signedAt: null, remindersSent: 0, escalatedAt: null };
   const steps: Partial<Record<StepName, StepStatus>> = {
     hrRecord: 'pending',
+    contract: 'pending',
     email: 'pending',
     slack: 'pending',
     laptop: 'pending',
     payroll: 'pending',
   };
   if (hire.role === 'engineer') steps.github = 'pending';
+  steps.welcome = 'pending';
   const resources: Partial<Record<StepName, string>> = {};
+
+  const toMs = (d: Duration) => (typeof d === 'number' ? d : ms(d));
+  const welcomeEmailAt = () => new Date(Date.parse(startDate) - toMs(t.welcomeLeadTime));
 
   const progress = (): OnboardingProgress => {
     const all = Object.values(steps);
@@ -44,11 +66,25 @@ export async function onboardingWorkflow(hire: NewHire): Promise<OnboardingProgr
     return {
       status,
       percentComplete: Math.round((done / all.length) * 100),
+      startDate,
+      welcomeEmailAt: welcomeEmailAt().toISOString(),
+      contract: { ...contract },
       steps: { ...steps },
       resources: { ...resources },
     };
   };
+
+  // Handlers only record the event; the main flow below decides what to do with it.
   setHandler(progressQuery, progress);
+  setHandler(contractSignedSignal, () => {
+    // Idempotent: signing twice keeps the original timestamp.
+    contract.signedAt ??= new Date().toISOString();
+  });
+  setHandler(updateStartDateSignal, (newStartDate) => {
+    if (newStartDate === startDate) return;
+    startDate = newStartDate;
+    startDateChanged = true;
+  });
 
   async function runStep(name: StepName, activity: () => Promise<string>): Promise<void> {
     steps[name] = 'running';
@@ -65,7 +101,28 @@ export async function onboardingWorkflow(hire: NewHire): Promise<OnboardingProgr
     // Everything else depends on the employee existing in the HR system.
     await runStep('hrRecord', () => acts.createHrRecord(hire));
 
+    // Nothing gets provisioned until the contract is signed. A pending
+    // condition() costs nothing: no thread or poller is held while we wait.
+    await runStep('contract', async () => {
+      const envelopeId = await acts.sendContract(hire);
+      contract.sentAt = new Date().toISOString();
+      const signed = () => contract.signedAt !== null;
+
+      if (!(await condition(signed, t.contractReminderDelay))) {
+        await acts.sendContractReminder(hire);
+        contract.remindersSent++;
+
+        if (!(await condition(signed, t.contractEscalationDelay))) {
+          await acts.escalateToHr(hire, 'Contract still unsigned after reminder');
+          contract.escalatedAt = new Date().toISOString();
+          await condition(signed); // HR follows up; keep waiting without a deadline
+        }
+      }
+      return envelopeId;
+    });
+
     // The remaining systems are independent, so they are provisioned in parallel.
+    status = 'PROVISIONING';
     const provisioning: [StepName, () => Promise<string>][] = [
       ['email', () => acts.createEmailAccount(hire)],
       ['slack', () => acts.createSlackAccount(hire)],
@@ -86,6 +143,21 @@ export async function onboardingWorkflow(hire: NewHire): Promise<OnboardingProgr
         'ProvisioningFailed',
       );
     }
+
+    // Sleep until the welcome email is due. The wait may be weeks long; if the
+    // start date changes meanwhile, the timer is recomputed from the new date.
+    status = 'AWAITING_START_DATE';
+    for (;;) {
+      if (startDateChanged) {
+        startDateChanged = false;
+        await acts.notifyStartDateChanged(hire, startDate);
+      }
+      const remaining = welcomeEmailAt().getTime() - Date.now();
+      if (remaining <= 0) break;
+      if (!(await condition(() => startDateChanged, remaining))) break;
+    }
+
+    await runStep('welcome', () => acts.sendWelcomeEmail({ ...hire, startDate }, resources.email!));
 
     status = 'COMPLETED';
     return progress();

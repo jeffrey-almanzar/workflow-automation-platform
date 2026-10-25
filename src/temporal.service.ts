@@ -1,4 +1,4 @@
-// Service that talks to Temporal to start and monitor workflows.
+// Service that talks to Temporal to start, signal and monitor workflows.
 
 import { ConflictException, Injectable, NotFoundException, OnModuleInit } from '@nestjs/common';
 import {
@@ -7,12 +7,43 @@ import {
   WorkflowExecutionAlreadyStartedError,
   WorkflowNotFoundError,
 } from '@temporalio/client';
-import { NewHire, TASK_QUEUE, progressQuery } from './shared';
+import ms, { type StringValue } from 'ms';
+import {
+  NewHire,
+  OnboardingTimings,
+  TASK_QUEUE,
+  contractSignedSignal,
+  progressQuery,
+  updateStartDateSignal,
+} from './shared';
 import type { onboardingWorkflow } from './workflows';
+
+const QUERY_TIMEOUT_MS = 3000;
+
+// Optional overrides (e.g. "30 seconds") so the human-step timers can be
+// demoed locally without waiting days. Unset values fall back to DEFAULT_TIMINGS.
+function timingsFromEnv(): Partial<OnboardingTimings> {
+  const timings: Partial<OnboardingTimings> = {};
+  const env = {
+    contractReminderDelay: process.env.CONTRACT_REMINDER_DELAY,
+    contractEscalationDelay: process.env.CONTRACT_ESCALATION_DELAY,
+    welcomeLeadTime: process.env.WELCOME_LEAD_TIME,
+  };
+  for (const [key, value] of Object.entries(env)) {
+    if (!value) continue;
+    // Fail at boot rather than starting workflows that would crash on a bad timer.
+    if (!Number.isFinite(ms(value as StringValue))) {
+      throw new Error(`Invalid duration for ${key}: "${value}" (expected e.g. "30 seconds", "3 days")`);
+    }
+    timings[key as keyof OnboardingTimings] = value as StringValue;
+  }
+  return timings;
+}
 
 @Injectable()
 export class TemporalService implements OnModuleInit {
   private client!: Client;
+  private readonly timings = timingsFromEnv();
 
   async onModuleInit() {
     const connection = await Connection.connect({
@@ -29,7 +60,7 @@ export class TemporalService implements OnModuleInit {
       const handle = await this.client.workflow.start<typeof onboardingWorkflow>('onboardingWorkflow', {
         taskQueue: TASK_QUEUE,
         workflowId,
-        args: [hire],
+        args: [hire, this.timings],
       });
       return handle.workflowId;
     } catch (err) {
@@ -44,20 +75,57 @@ export class TemporalService implements OnModuleInit {
     const handle = this.client.workflow.getHandle(workflowId);
     try {
       // describe() comes from the Temporal server; the query is answered by the
-      // workflow's own in-memory state (via a worker).
-      const [description, progress] = await Promise.all([handle.describe(), handle.query(progressQuery)]);
-      return {
+      // workflow's own in-memory state, which requires a worker to be running.
+      const description = await handle.describe();
+      const summary = {
         onboardingId: workflowId,
         workflowStatus: description.status.name,
         startedAt: description.startTime,
         closedAt: description.closeTime ?? null,
-        ...progress,
       };
+      try {
+        const progress = await this.client.withDeadline(Date.now() + QUERY_TIMEOUT_MS, () =>
+          handle.query(progressQuery),
+        );
+        return { ...summary, ...progress };
+      } catch {
+        // No worker answered (e.g. all workers down or redeploying). The workflow is
+        // safe in Temporal; degrade to the server-side status instead of hanging.
+        return { ...summary, progress: null, warning: 'Detailed progress unavailable: no worker responded' };
+      }
     } catch (err) {
       if (err instanceof WorkflowNotFoundError) {
         throw new NotFoundException(`Onboarding ${workflowId} not found`);
       }
       throw err;
+    }
+  }
+
+  signContract(workflowId: string): Promise<void> {
+    return this.signal(workflowId, (handle) => handle.signal(contractSignedSignal));
+  }
+
+  updateStartDate(workflowId: string, startDate: string): Promise<void> {
+    return this.signal(workflowId, (handle) => handle.signal(updateStartDateSignal, startDate));
+  }
+
+  private async signal(
+    workflowId: string,
+    send: (handle: ReturnType<Client['workflow']['getHandle']>) => Promise<void>,
+  ): Promise<void> {
+    const handle = this.client.workflow.getHandle(workflowId);
+    try {
+      await send(handle);
+    } catch (err) {
+      if (!(err instanceof WorkflowNotFoundError)) throw err;
+      // Temporal reports "not found" both for unknown IDs and for workflows that
+      // already finished; describe() tells the two apart.
+      const exists = await handle.describe().then(
+        () => true,
+        () => false,
+      );
+      if (exists) throw new ConflictException(`Onboarding ${workflowId} has already finished`);
+      throw new NotFoundException(`Onboarding ${workflowId} not found`);
     }
   }
 }
