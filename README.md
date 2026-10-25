@@ -44,16 +44,36 @@ This project covers several key concepts, including distributed workflow orchest
 
 This section walks through what actually runs today in `src/`, end to end.
 
+### The use case: employee onboarding
+
+When someone is hired, several independent systems must be set up: an HR record, a company email account, Slack, GitHub (engineers only), a laptop order and payroll enrollment. `onboardingWorkflow` orchestrates all of them:
+
+```
+POST /onboardings ──▶ onboardingWorkflow(newHire)
+  1. createHrRecord                       (everything else depends on it)
+  2. in parallel:
+       createEmailAccount ┐
+       createSlackAccount │ each retried independently
+       grantGithubAccess  │ (1s, 2s, 4s, 8s backoff, 5 attempts)
+       orderLaptop        │
+       enrollInPayroll    ┘
+  3. COMPLETED, or FAILED if any step exhausted its retries
+GET /onboardings/:id ──▶ progress query (live step-by-step state)
+```
+
+The external systems are mocked for now ([src/activities.ts](src/activities.ts)), with realistic latency and optional random failures.
+
 ### The moving pieces
 
 | File | Role |
 | --- | --- |
-| [src/main.ts](src/main.ts) | Boots the NestJS app and starts listening on port 3000. |
-| [src/app.module.ts](src/app.module.ts) | Root module; wires `WorkflowController` and `TemporalService` together. |
-| [src/workflow.controller.ts](src/workflow.controller.ts) | HTTP layer: `POST /workflow/start` and `GET /workflow/:id/status`. |
-| [src/temporal.service.ts](src/temporal.service.ts) | Temporal **client**: opens a connection to the Temporal server and asks it to start/describe workflows. |
-| [src/workflows.ts](src/workflows.ts) | The actual workflow logic (`exampleWorkflow`), executed by the worker, not by the NestJS process. |
-| [src/activities.ts](src/activities.ts) | Activities — the "do real work" steps a workflow calls out to (here, a simple `greet`). |
+| [src/main.ts](src/main.ts) | Boots the NestJS app, enables request validation, and listens on port 3000. |
+| [src/app.module.ts](src/app.module.ts) | Root module; wires `OnboardingController` and `TemporalService` together. |
+| [src/onboarding.controller.ts](src/onboarding.controller.ts) | HTTP layer and request DTO: `POST /onboardings` and `GET /onboardings/:id`. |
+| [src/temporal.service.ts](src/temporal.service.ts) | Temporal **client**: starts onboarding workflows and reads their state; maps Temporal errors to HTTP 404/409. |
+| [src/shared.ts](src/shared.ts) | Types, task queue name and the `progress` query definition shared by the API and the worker. |
+| [src/workflows.ts](src/workflows.ts) | The orchestration logic (`onboardingWorkflow`), executed by the worker, not by the NestJS process. |
+| [src/activities.ts](src/activities.ts) | Activities: one per external system (HR, email, Slack, GitHub, laptop vendor, payroll). |
 | [src/worker.ts](src/worker.ts) | A separate Node process that polls Temporal for work and executes `workflows.ts`/`activities.ts`. |
 
 Two independent Node processes come out of this codebase:
@@ -62,23 +82,24 @@ Two independent Node processes come out of this codebase:
 
 They never call each other directly; Temporal is the broker in between. This separation is what gives Temporal its durability: if the worker crashes mid-workflow, Temporal remembers exactly where it was and resumes on another worker once one reconnects.
 
-### Request lifecycle: starting a workflow
+### Request lifecycle: starting an onboarding
 
-1. A client sends `POST /workflow/start`.
-2. `WorkflowController.startWorkflow()` delegates to `TemporalService.startWorkflow()`.
-3. `TemporalService` calls `client.start('exampleWorkflow', { taskQueue: 'exampleTaskQueue', workflowId, args })` on its `WorkflowClient`. This is a request to the Temporal **server** — it just records "please run this workflow" and returns immediately with a `workflowId`. No business logic has executed yet.
-4. Temporal places a workflow task on the `exampleTaskQueue`.
-5. The `worker` process, which has been polling that same task queue since startup, picks up the task and runs `exampleWorkflow(name)` from `workflows.ts`.
-6. Inside the workflow, `proxyActivities` schedules the `greet` activity. Temporal dispatches that as an *activity task*, also on `exampleTaskQueue`, which the same worker executes.
-7. `greet` runs and returns a string; the workflow returns that string as its result; the worker reports completion back to Temporal.
-8. The NestJS API never has to do anything else here — all of this happens asynchronously, driven by the worker and the Temporal server.
+1. A client sends `POST /onboardings` with the new hire's data. NestJS's `ValidationPipe` rejects malformed bodies with a 400 before anything reaches Temporal.
+2. `OnboardingController.start()` delegates to `TemporalService.startOnboarding()`.
+3. `TemporalService` calls `client.workflow.start('onboardingWorkflow', { taskQueue: 'onboarding', workflowId: 'onboarding-<employeeId>', args: [hire] })`. This only asks the Temporal **server** to record "please run this workflow" and returns immediately, so the API answers `202 Accepted` with the `onboardingId`. No business logic has executed yet.
+4. Because the workflow ID is derived from the employee ID, Temporal rejects a second onboarding for the same person, which the API returns as `409 Conflict`. Deduplication comes for free, with no extra table or lock.
+5. The `worker`, polling the `onboarding` task queue, picks up the task and runs `onboardingWorkflow`.
+6. The workflow schedules `createHrRecord`, then the remaining activities in parallel. Temporal dispatches each as an *activity task*; a failed attempt is retried with exponential backoff without the workflow code doing anything.
+7. Each activity returns the ID of what it created (email address, order number, ...). The workflow keeps these, since they will be needed to undo steps when compensation is added.
+8. The workflow completes, or fails if a step exhausts its retries.
 
-### Request lifecycle: checking status
+### Request lifecycle: checking progress
 
-1. A client sends `GET /workflow/:id/status`.
-2. `WorkflowController.getStatus()` delegates to `TemporalService.getWorkflowStatus(id)`.
-3. `TemporalService` calls `client.getHandle(id).describe()`, which asks the Temporal server for that workflow's current execution state (`RUNNING`, `COMPLETED`, `FAILED`, etc.) plus metadata like start time and history length.
-4. Temporal answers from its own persisted state (backed by PostgreSQL) — it doesn't need to contact the worker to answer this.
+1. A client sends `GET /onboardings/:id`.
+2. `TemporalService.getOnboarding()` does two things in parallel:
+   - `describe()` asks the Temporal **server** for the execution status (`RUNNING`, `COMPLETED`, `FAILED`) and timestamps.
+   - `query(progressQuery)` asks the **workflow itself** for its in-memory state: which steps are pending, running, done or failed, plus the created resource IDs. There is no separate status table to keep in sync.
+3. An unknown ID returns `404 Not Found`.
 
 ### Why a separate worker process?
 
@@ -86,23 +107,34 @@ Workflow code has to be deterministic (same inputs always produce the same seque
 
 ### Local topology
 
-Running `docker compose up` starts four containers that map directly onto the pieces above:
+Running `docker compose up` starts five containers that map directly onto the pieces above:
 
 ```
 app (NestJS, :3000) ──Temporal client──▶ temporal (:7233) ◀──polls── worker
-                                              │
-                                         postgres (:5432)
+                                           │       ▲
+                                  postgres (:5432)  temporal-ui (:8080)
 ```
 
 ## Local environment (cloud simulation)
 
-To emulate the project's cloud environment, we use Docker Compose to spin up the required services locally. This includes Temporal, PostgreSQL, and the NestJS application.
+To emulate the project's cloud environment, we use Docker Compose to spin up the required services locally. This includes Temporal, its Web UI, PostgreSQL, the NestJS API and the worker.
 
-1. We emulate Temporal and PostgreSQL using Docker Compose.
-2. Run `docker compose up` in the root directory to start the services (`docker compose down` to stop them).
-3. The NestJS app will be available at `http://localhost:3000` and Temporal at `localhost:7233`.
-4. Make sure environment variables point to these local endpoints to test the application.
-5. Verify everything works by hitting `http://localhost:3000/workflow/start` to kick off a workflow.
+1. Run `docker compose up --build` in the root directory (`docker compose down` to stop).
+2. The API is available at `http://localhost:3000`, Temporal at `localhost:7233`, and the Temporal Web UI at `http://localhost:8080`, where you can inspect every workflow's event history.
+3. Start an onboarding:
+   ```bash
+   curl -X POST localhost:3000/onboardings -H 'Content-Type: application/json' -d '{
+     "employeeId": "E1001",
+     "fullName": "Ana López",
+     "personalEmail": "ana@example.com",
+     "role": "engineer",
+     "startDate": "2026-11-16"
+   }'
+   # → 202 {"onboardingId":"onboarding-E1001"}
+   ```
+4. Check its progress: `curl localhost:3000/onboardings/onboarding-E1001`
+5. To watch retries happen, make the mocked systems fail randomly and restart the worker:
+   `MOCK_FAILURE_RATE=0.5 docker compose up -d worker`. Failed attempts appear as retries in the Web UI.
 
 ## Cloud deployment
 

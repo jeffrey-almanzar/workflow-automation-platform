@@ -4,6 +4,7 @@
 
 import { NativeConnection, Worker } from '@temporalio/worker';
 import * as activities from './activities';
+import { TASK_QUEUE } from './shared';
 
 async function run() {
   const connection = await NativeConnection.connect({
@@ -14,10 +15,10 @@ async function run() {
     connection,
     workflowsPath: require.resolve('./workflows'),
     activities,
-    taskQueue: 'exampleTaskQueue',
+    taskQueue: TASK_QUEUE,
   });
 
-  console.log('Worker listening on task queue "exampleTaskQueue"...');
+  console.log(`Worker listening on task queue "${TASK_QUEUE}"...`);
   await worker.run();
 }
 

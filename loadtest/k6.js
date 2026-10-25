@@ -13,10 +13,23 @@ export const options = {
   ],
 };
 
+const roles = ['engineer', 'sales', 'operations'];
+
 export default function () {
-  const res = http.get('http://localhost:3000/workflow/start');
+  // Unique per VU + iteration: the API rejects duplicate employee IDs with 409.
+  const employeeId = `load-${__VU}-${__ITER}-${Date.now()}`;
+  const payload = JSON.stringify({
+    employeeId,
+    fullName: 'Load Test',
+    personalEmail: `${employeeId}@example.com`,
+    role: roles[__ITER % roles.length],
+    startDate: '2026-12-01',
+  });
+  const res = http.post('http://localhost:3000/onboardings', payload, {
+    headers: { 'Content-Type': 'application/json' },
+  });
   check(res, {
-    'status is 200': (r) => r.status === 200,
+    'status is 202': (r) => r.status === 202,
   });
   sleep(1);
 }
