@@ -175,7 +175,7 @@ Temporal retries a failed activity automatically, which raises the classic distr
 The fix spans both sides of the call:
 
 - **The caller sends an idempotency key** that is identical on every retry of an activity call and different for any other call: `<workflow run ID>:<activity ID>` ([src/vendors.ts](src/vendors.ts)). A rehire runs a new workflow run, so it correctly gets new keys.
-- **The vendor stores the key with its response in the same transaction as the side effect** ([lambdas/vendors/index.ts](lambdas/vendors/index.ts)). A repeated key returns the stored response (`replayed: true`) without doing the work again. If two identical requests race, the unique key lets only one commit.
+- **The vendor claims the key before doing the work, and stores the response in the same transaction as the side effect** ([lambdas/vendors/index.ts](lambdas/vendors/index.ts)). A repeated key returns the stored response (`replayed: true`) without doing the work again. If two identical requests race, the second one blocks on the key until the first commits, then returns its response, so a duplicate never even starts the work. (Rolling back a duplicate *after* doing the work would only be safe here because the simulated work is a database insert; a real vendor's side effects, like sending an email, can't be rolled back.)
 - **Our own writes are idempotent too**: the employee record is an upsert, and audit rows are keyed by activity call (`ON CONFLICT DO NOTHING`), so a retried activity never writes a second audit entry.
 - **Retries happen in exactly one place.** The AWS SDK's own retries are disabled (`maxAttempts: 1`); Temporal's retry policy is the only one, so attempts aren't multiplied and every retry is visible in the workflow history.
 
@@ -279,38 +279,50 @@ We use k6, an open-source load testing tool, to run load tests.
 | Error rate | < 0.1% | Measured with k6 by observing http_req_failed. |
 | Saturation point | Degradation starting around ~3,500 req/s | Observed during load testing with k6. |
 
-## Tests (unit / integration)
+## Tests
 
-To ensure code quality, we implement unit and integration tests.
-
-Example unit test for `TemporalService`:
-```typescript
-import { Test, TestingModule } from '@nestjs/testing';
-import { TemporalService } from './temporal.service';
-
-describe('TemporalService', () => {
-  let service: TemporalService;
-
-  beforeEach(async () => {
-    const module: TestingModule = await Test.createTestingModule({
-      providers: [TemporalService],
-    }).compile();
-
-    service = module.get<TemporalService>(TemporalService);
-  });
-
-  it('should be defined', () => {
-    expect(service).toBeDefined();
-  });
-
-  it('should start a workflow', async () => {
-    const workflowId = await service.startWorkflow();
-    expect(workflowId).toBeDefined();
-  });
-});
+```bash
+npm test                      # unit project: no external services needed (~15s)
+npm run test:integration      # needs the docker-compose Postgres on localhost:5432
+npm run test:record-histories # re-record replay fixtures (see below)
 ```
 
-For integration tests, it's recommended to use a test environment that emulates the full infrastructure.
+| Suite | What it covers |
+| --- | --- |
+| [test/onboarding.workflow.test.ts](test/onboarding.workflow.test.ts) | The onboarding workflow end to end with mocked activities: happy path, role-based steps, the 3-day reminder and 7-day escalation, start-date changes, retries, and every saga path (cancel at each stage, cancel during in-flight provisioning, permanent failure, failing compensation, cancel issued through Temporal). |
+| [test/offboarding.workflow.test.ts](test/offboarding.workflow.test.ts) | Scheduled revocation, phase ordering (access first, HR record last), skipping resources that were never created, escalation on failure. |
+| [test/replay.test.ts](test/replay.test.ts) | Replays recorded workflow histories against the current code to catch nondeterministic changes. |
+| [test/api.test.ts](test/api.test.ts) | HTTP validation and routing, with the production app configuration and a mocked `TemporalService`. |
+| [test/temporal.service.test.ts](test/temporal.service.test.ts) | Mapping of Temporal errors and states to HTTP `404`/`409`, degraded progress when no worker responds, offboarding preconditions. |
+| [test/vendors.client.test.ts](test/vendors.client.test.ts) | Idempotency key derivation (stable across retries, unique per call and per run) and Lambda error handling. |
+| [test/vendors.lambda.int.test.ts](test/vendors.lambda.int.test.ts) | The vendors Lambda against real Postgres: repeated keys, lost responses, five concurrent identical requests, failed calls, idempotent deactivation. |
+
+### Testing time: the time-skipping test server
+
+The workflow tests run against Temporal's time-skipping test server (`TestWorkflowEnvironment.createTimeSkipping()`) with the **real production timings**. Whenever the workflow is only waiting on a timer, the server jumps ahead, so the 7-day escalation and the 4-week wait for the start date take milliseconds:
+
+```ts
+await until((p) => p.contract.sentAt !== null);
+await env.sleep('3 days');                                   // instant
+await until((p) => p.contract.remindersSent === 1);
+await env.sleep('4 days');                                   // instant
+await until((p) => p.contract.escalatedAt !== null);
+```
+
+Mock activities record the workflow-clock time each call was scheduled at, so tests can assert that the welcome email went out exactly one day before the (possibly rescheduled) start date.
+
+### Replay tests: protecting workflows already in flight
+
+Temporal rebuilds a workflow's state by replaying its history through the code, so changing workflow code can break workflows that started under the old version (for example, inserting a new activity call before an existing one). [test/replay.test.ts](test/replay.test.ts) replays the histories in [test/histories/](test/histories/) against the current code and fails with a `DeterminismViolationError` on such a change. The fix is then to gate the change with `patched()` rather than editing the workflow in place.
+
+When shipping an intentional new workflow version, record new fixtures alongside the old ones (`npm run test:record-histories v2`); the old ones represent workflows still running in production.
+
+### Do the tests catch real bugs?
+
+They were checked by deliberately breaking the code:
+
+- Compensating in forward instead of reverse order fails 4 workflow tests.
+- Inserting a new activity call before the contract step fails both replay tests with `Nondeterminism error: Activity type of scheduled event 'sendContract' does not match activity type of activity command 'escalateToHr'`.
 
 ## Technical complexities
 

@@ -18,5 +18,5 @@
     "strictBindCallApply": false,
     "esModuleInterop": true
   },
-  "exclude": ["node_modules", "dist", "lambdas", "loadtest"]
+  "exclude": ["node_modules", "dist", "lambdas", "loadtest", "test"]
 }

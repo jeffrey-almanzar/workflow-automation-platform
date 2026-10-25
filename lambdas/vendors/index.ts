@@ -2,15 +2,16 @@
 // (e-signature, email, Slack, GitHub, laptop vendor, payroll). It keeps its own
 // state in a separate `vendors` schema, the way a real vendor has its own database.
 //
-// Every request carries an idempotency key. The key and the response are stored
-// in the same transaction as the side effect, so a retried request (e.g. after a
-// timeout where the work actually succeeded) gets the original response back
-// instead of creating a second account.
+// Every request carries an idempotency key. The key is claimed and the response
+// stored in the same transaction as the side effect, so a retried request (e.g.
+// after a timeout where the work actually succeeded) gets the original response
+// back instead of creating a second account, even if the duplicates race.
 //
 // Failure injection, for demos:
 //   MOCK_FAILURE_RATE        probability (0-1) a call fails before doing any work
 //   MOCK_FAILING_SYSTEMS     comma-separated systems that always fail, e.g. "github,slack"
 //   MOCK_LOST_RESPONSE_RATE  probability the work is committed but the response is lost
+//   MOCK_LATENCY_SCALE       multiplier for simulated latency (0 disables it, e.g. in tests)
 
 import { randomUUID } from 'crypto';
 import { Pool, PoolClient } from 'pg';
@@ -37,14 +38,24 @@ export interface VendorResponse {
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: Number(process.env.PG_POOL_MAX ?? 2) });
 let migrated: Promise<void> | undefined;
 
-const FAILURE_RATE = Number(process.env.MOCK_FAILURE_RATE ?? 0);
-const LOST_RESPONSE_RATE = Number(process.env.MOCK_LOST_RESPONSE_RATE ?? 0);
-const FAILING_SYSTEMS = new Set(
-  (process.env.MOCK_FAILING_SYSTEMS ?? '')
-    .split(',')
-    .map((name) => name.trim().toLowerCase())
-    .filter(Boolean),
-);
+// Read per invocation (it's cheap) so tests can change failure injection between calls.
+function mockConfig() {
+  return {
+    failureRate: Number(process.env.MOCK_FAILURE_RATE ?? 0),
+    lostResponseRate: Number(process.env.MOCK_LOST_RESPONSE_RATE ?? 0),
+    latencyScale: Number(process.env.MOCK_LATENCY_SCALE ?? 1),
+    failingSystems: new Set(
+      (process.env.MOCK_FAILING_SYSTEMS ?? '')
+        .split(',')
+        .map((name) => name.trim().toLowerCase())
+        .filter(Boolean),
+    ),
+  };
+}
+
+export function closePool(): Promise<void> {
+  return pool.end();
+}
 
 // Per-vendor latency range in ms. The laptop vendor is the slowest.
 const LATENCY: Record<VendorSystem, [number, number]> = {
@@ -173,31 +184,41 @@ export const handler = async (event: VendorRequest): Promise<VendorResponse> => 
     return { ...prior.rows[0].response, replayed: true };
   }
 
-  const [min, max] = LATENCY[event.system];
-  await sleep(min + Math.random() * (max - min));
-  if (FAILING_SYSTEMS.has(event.system) || Math.random() < FAILURE_RATE) {
-    throw new Error(`${event.system} is temporarily unavailable`);
-  }
-
+  const config = mockConfig();
   const db = await pool.connect();
   let response: VendorResponse;
   try {
     await db.query('BEGIN');
-    const resourceId = await perform(db, event);
-    response = { resourceId, replayed: false };
-    const stored = await db.query(
+    // Claim the key *before* doing the work. If an identical request is in flight,
+    // this INSERT blocks until that transaction ends: if it committed, we get a
+    // conflict and return its response; if it rolled back, we proceed.
+    const claimed = await db.query(
       `INSERT INTO vendors.requests (idempotency_key, system, operation, response)
-       VALUES ($1, $2, $3, $4) ON CONFLICT (idempotency_key) DO NOTHING`,
-      [event.idempotencyKey, event.system, event.operation, { resourceId }],
+       VALUES ($1, $2, $3, '{}') ON CONFLICT (idempotency_key) DO NOTHING`,
+      [event.idempotencyKey, event.system, event.operation],
     );
-    if (stored.rowCount === 0) {
-      // A concurrent duplicate committed first: discard our work, return theirs.
+    if (claimed.rowCount === 0) {
       await db.query('ROLLBACK');
       const winner = await db.query('SELECT response FROM vendors.requests WHERE idempotency_key = $1', [
         event.idempotencyKey,
       ]);
       return { ...winner.rows[0].response, replayed: true };
     }
+
+    // Simulated processing time, while holding the key. A failure here rolls back
+    // the claim too, so a retry starts from scratch.
+    const [min, max] = LATENCY[event.system];
+    await sleep((min + Math.random() * (max - min)) * config.latencyScale);
+    if (config.failingSystems.has(event.system) || Math.random() < config.failureRate) {
+      throw new Error(`${event.system} is temporarily unavailable`);
+    }
+
+    const resourceId = await perform(db, event);
+    response = { resourceId, replayed: false };
+    await db.query('UPDATE vendors.requests SET response = $2 WHERE idempotency_key = $1', [
+      event.idempotencyKey,
+      { resourceId },
+    ]);
     await db.query('COMMIT');
   } catch (err) {
     await db.query('ROLLBACK').catch(() => {});
@@ -207,7 +228,7 @@ export const handler = async (event: VendorRequest): Promise<VendorResponse> => 
   }
 
   console.log(JSON.stringify({ msg: 'performed', ...event, resourceId: response.resourceId }));
-  if (Math.random() < LOST_RESPONSE_RATE) {
+  if (Math.random() < config.lostResponseRate) {
     // The work is committed, but the caller never hears back: the classic case
     // where a naive retry would create a duplicate.
     throw new Error(`${event.system}: connection reset after the request was processed`);

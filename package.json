@@ -8,7 +8,9 @@
     "start:dev": "nest start --watch",
     "start:worker": "node dist/worker",
     "start:worker:dev": "ts-node src/worker.ts",
-    "test": "jest"
+    "test": "jest --selectProjects unit",
+    "test:integration": "jest --selectProjects integration",
+    "test:record-histories": "ts-node test/record-histories.ts"
   },
   "dependencies": {
     "@aws-sdk/client-lambda": "^3.1149.0",
@@ -24,12 +26,14 @@
     "class-validator": "^0.15.1",
     "ms": "3.0.0-canary.1",
     "pg": "^8.23.1",
+    "protobufjs": "^8.8.1",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1"
   },
   "devDependencies": {
     "@nestjs/cli": "^10.4.5",
     "@nestjs/testing": "^10.4.0",
+    "@temporalio/testing": "^1.24.0",
     "@types/jest": "^29.5.12",
     "@types/node": "^20.14.0",
     "@types/pg": "^8.23.1",
