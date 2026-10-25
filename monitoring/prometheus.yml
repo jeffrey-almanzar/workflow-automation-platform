@@ -1,0 +1,17 @@
+# Scrapes the three metric sources of the local stack every 5s.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: api # NestJS: HTTP latency/throughput (prom-client)
+    static_configs:
+      - targets: ['app:3000']
+  - job_name: worker # Temporal SDK exporter: activities, workflow tasks, custom counters
+    # DNS discovery finds every replica (docker compose up --scale worker=N).
+    dns_sd_configs:
+      - names: ['worker']
+        type: A
+        port: 9464
+  - job_name: temporal # Temporal server: workflow lifecycle, persistence
+    static_configs:
+      - targets: ['temporal:8000']

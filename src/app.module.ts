@@ -3,13 +3,14 @@
 import { Module } from '@nestjs/common';
 import { DatabaseService } from './database.service';
 import { EmployeesController } from './employees.controller';
+import { MetricsController } from './metrics';
 import { OffboardingController } from './offboarding.controller';
 import { OnboardingController } from './onboarding.controller';
 import { TemporalService } from './temporal.service';
 
 @Module({
   imports: [],
-  controllers: [OnboardingController, OffboardingController, EmployeesController],
+  controllers: [OnboardingController, OffboardingController, EmployeesController, MetricsController],
   providers: [TemporalService, DatabaseService],
 })
 export class AppModule {}

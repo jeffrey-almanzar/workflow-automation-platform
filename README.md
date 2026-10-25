@@ -202,7 +202,7 @@ Workflow code has to be deterministic (same inputs always produce the same seque
 
 ### Local topology
 
-Running `docker compose up` starts six containers that map directly onto the pieces above:
+Running `docker compose up` starts the six application containers below, plus Prometheus and Grafana for monitoring:
 
 ```
 app (NestJS, :3000) ──Temporal client──▶ temporal (:7233) ◀──polls── worker ──Lambda Invoke API──▶ vendors
@@ -261,23 +261,56 @@ To deploy the application to the cloud, follow these steps:
 5. Make sure the environment variables in AWS Lambda point to the right services.
 6. Verify the application is running correctly by hitting the production endpoints.
 
+## Monitoring
+
+Prometheus and Grafana run in docker-compose (local only; they are not part of the AWS deployment).
+
+- **Grafana:** http://localhost:3001 (no login). The provisioned "Onboarding platform" dashboard ([monitoring/grafana/dashboards/onboarding.json](monitoring/grafana/dashboards/onboarding.json)) opens by default.
+- **Prometheus:** http://localhost:9090, scraping every 5s ([monitoring/prometheus.yml](monitoring/prometheus.yml)).
+
+| Source | What it exposes |
+| --- | --- |
+| API (`GET /metrics`, [src/metrics.ts](src/metrics.ts)) | `http_request_duration_seconds` by route pattern and status, plus Node.js process metrics |
+| Worker (`:9464`, Temporal SDK exporter in [src/worker.ts](src/worker.ts)) | Activity and workflow-task latency, failures, schedule-to-start (queueing) latency, slots, plus custom counters: `onboarding_events_total{event, workflow_type}` for every audit event and `vendor_replayed_responses_total{system}` for duplicates prevented |
+| Temporal server (`:8000`) | Workflow lifecycle, persistence latency, history shard and internal queue metrics |
+
+The dashboard has three rows: business outcomes (onboardings completed and rolled back, HR escalations, duplicates prevented), the API (throughput, p50/p95/p99, status codes), and saturation signals (completions, activity latency and failures, schedule-to-start latency, task slots, Temporal persistence latency). Worker replicas (`docker compose up --scale worker=N`) are discovered through DNS.
+
 ## Load testing
 
-We use k6, an open-source load testing tool, to run load tests.
+[loadtest/k6.js](loadtest/k6.js) drives full hires: each iteration starts an onboarding, signs the contract (which triggers parallel provisioning against the vendors Lambda), and 1 in 10 also reads progress. Start dates are an hour out, so every workflow runs to completion.
 
-1. Define a load test script in `loadtest/k6.js` with p95/p99 thresholds.
-2. Run `k6 run loadtest/k6.js` to start the load test.
-3. Configure Prometheus and Grafana to observe the load test results.
-4. Monitor performance metrics and adjust infrastructure as needed.
+```bash
+docker compose --profile loadtest run --rm k6                                # ramp: 25 -> 50 -> 100 -> 200 hires/s
+docker compose --profile loadtest run --rm -e RATE=10 -e DURATION=2m k6      # constant rate
+```
 
-## Target metrics
+Watch the Grafana dashboard while it runs. Above capacity, workflows keep running after k6 stops; clean them up with
+`docker compose exec temporal temporal workflow terminate --query "ExecutionStatus='Running' AND WorkflowId STARTS_WITH 'onboarding-lt-'" --yes --address temporal:7233`.
 
-| Metric | Target | How to measure |
-| --- | --- | --- |
-| Target QPS / RPS | 2,000 sustained req/s | Measured with k6 and monitored with Prometheus. |
-| p50 / p95 / p99 latency | p99 < 200ms | Latency metrics measured with k6 and visualized in Grafana. |
-| Error rate | < 0.1% | Measured with k6 by observing http_req_failed. |
-| Saturation point | Degradation starting around ~3,500 req/s | Observed during load testing with k6. |
+### Results
+
+Measured on an Apple M1 Pro (Docker Desktop: 10 CPUs, 7.7 GB), single-node Temporal (`auto-setup`, 4 history shards, Postgres), one worker, SDK defaults, simulated vendor latency of 0.1–2 s per call. Constant-rate runs of 2 minutes:
+
+| Hires/s offered | Completed/s | API p95 / p99 | End-to-end onboarding p95 | Activity queueing p95 | Backlog after run |
+| --- | --- | --- | --- | --- | --- |
+| **10** | **10.0** | **91 ms / 221 ms** | **4.9 s** | **0.2 s** | **0** |
+| 15 | 10.6 | 166 ms / 527 ms | 41 s | 9.6 s | 230 |
+| 20 | 7.6 | 373 ms / 1.7 s | 69 s | 22 s | 1,275 |
+| 25 | 5.0 | 1.0 s / 3.0 s | 90 s | 28 s | 2,330 |
+
+- **Sustainable throughput: about 10 onboardings/s** (around 25 API requests/s, 90 activities/s and 100 workflow tasks/s). At that rate the API meets the p95 < 200 ms target, the p99 is 221 ms, and there were 0 errors across all runs.
+- **Above roughly 11/s, throughput falls instead of levelling off**: queues grow without bound and onboardings take minutes. The API keeps accepting work (no errors), so overload shows up as latency, not failures. A production version should add backpressure, e.g. rejecting new onboardings with `429` when schedule-to-start latency is high.
+- The earlier README targets (2,000 req/s, saturation at ~3,500 req/s) were not measured and are not achievable with this setup; each request here starts a durable, multi-step workflow.
+
+### What load testing found
+
+Two real bugs, both fixed:
+
+1. **Email allocation probed candidates one query at a time** (`ana.lopez@`, `ana.lopez2@`, ...) inside a transaction. With many hires sharing a name, each call ran thousands of queries and starved the vendor's connection pool, slowing *every* vendor call to 4–7 s. It is now a single query ([lambdas/vendors/index.ts](lambdas/vendors/index.ts)), with a test for prefix names.
+2. **The local Lambda server ran in one Node process** and saturated a core. It now forks `LOCAL_LAMBDA_PROCESSES` (default 4), the local stand-in for Lambda scaling out.
+
+Changes that did **not** raise the ~10/s ceiling once those bugs were fixed: three worker replicas, 500 activity slots, 50 activity pollers, autoscaling pollers, 64 history shards, and `synchronous_commit=off` in Postgres. No single container was CPU-bound at the ceiling. The constraint shows up as activity schedule-to-start latency (tasks waiting in Temporal's matching queue while workers have free slots), which points at task dispatch in the single-node `auto-setup` server; the exact cause is not yet identified. Note also that the dashboard metric `temporal_workflow_task_replay_latency` counts every workflow task, not just cache misses.
 
 ## Tests
 

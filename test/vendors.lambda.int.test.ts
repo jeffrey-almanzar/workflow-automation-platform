@@ -68,7 +68,7 @@ test('lost response: the work is committed, and the retry gets the same resource
 
 test('concurrent identical requests: exactly one does the work, all get the same answer', async () => {
   const req = request();
-  // Some processing time guarantees the five transactions overlap.
+  // Some simulated latency so the five requests are in flight at the same time.
   process.env.MOCK_LATENCY_SCALE = '0.3';
   const results = await Promise.all(Array.from({ length: 5 }, () => handler(req))).finally(() => {
     process.env.MOCK_LATENCY_SCALE = '0';
@@ -81,8 +81,18 @@ test('concurrent identical requests: exactly one does the work, all get the same
 test('different keys for the same name are different hires and get distinct addresses', async () => {
   const a = await handler(request());
   const b = await handler(request());
-  expect(a.resourceId).not.toBe(b.resourceId);
+  const c = await handler(request());
   expect(b.resourceId).toBe(a.resourceId.replace('@', '2@'));
+  expect(c.resourceId).toBe(a.resourceId.replace('@', '3@'));
+});
+
+test('a name that is a prefix of another does not count its addresses', async () => {
+  // "test.ab" must not see "test.abc@" or "test.abc2@" as taken variants of itself.
+  const longer = await handler(request({ payload: { employeeId, fullName: `${fullName}x` } }));
+  const shorter = await handler(request());
+  expect(longer.resourceId).toMatch(/x@company\.com$/);
+  expect(shorter.resourceId).not.toBe(longer.resourceId);
+  expect(shorter.resourceId).toMatch(/^[a-z.]+@company\.com$/); // no number: first of its name
 });
 
 test('a failed call stores nothing, so the retry does the work', async () => {

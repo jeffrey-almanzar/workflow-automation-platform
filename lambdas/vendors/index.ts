@@ -118,14 +118,20 @@ async function allocateEmail(db: PoolClient, fullName = 'new hire'): Promise<str
     .trim()
     .split(/\s+/)
     .join('.');
-  for (let n = 1; ; n++) {
-    const candidate = `${local}${n === 1 ? '' : n}@company.com`;
-    const taken = await db.query('SELECT 1 FROM vendors.resources WHERE system = $1 AND resource_id = $2', [
-      'email',
-      candidate,
-    ]);
-    if (taken.rowCount === 0) return candidate;
-  }
+  // One query for every existing "<local>@" / "<local><n>@" address, rather than
+  // probing candidates one by one: with many people of the same name, probing
+  // ran thousands of queries per call and starved the connection pool.
+  const pattern = `^${local.replace(/\./g, '\\.')}([0-9]*)@company\\.com$`;
+  // substring() returns the captured number; the bare address ("") counts as 1.
+  const { rows } = await db.query<{ n: number }>(
+    `SELECT COALESCE(NULLIF(substring(resource_id FROM $1), ''), '1')::int AS n
+       FROM vendors.resources WHERE system = 'email' AND resource_id ~ $1`,
+    [pattern],
+  );
+  const next = rows.reduce((max, row) => Math.max(max, row.n), 0) + 1;
+  // Two hires with the same name racing here can pick the same address; the
+  // primary key rejects the second one and Temporal's retry picks the next number.
+  return `${local}${next === 1 ? '' : next}@company.com`;
 }
 
 const PREFIX: Record<VendorSystem, string> = {
@@ -184,7 +190,15 @@ export const handler = async (event: VendorRequest): Promise<VendorResponse> => 
     return { ...prior.rows[0].response, replayed: true };
   }
 
+  // Simulated processing time and failures happen before taking a database
+  // connection, so a slow vendor call doesn't hold one of the pool's few connections.
   const config = mockConfig();
+  const [min, max] = LATENCY[event.system];
+  await sleep((min + Math.random() * (max - min)) * config.latencyScale);
+  if (config.failingSystems.has(event.system) || Math.random() < config.failureRate) {
+    throw new Error(`${event.system} is temporarily unavailable`);
+  }
+
   const db = await pool.connect();
   let response: VendorResponse;
   try {
@@ -203,14 +217,6 @@ export const handler = async (event: VendorRequest): Promise<VendorResponse> => 
         event.idempotencyKey,
       ]);
       return { ...winner.rows[0].response, replayed: true };
-    }
-
-    // Simulated processing time, while holding the key. A failure here rolls back
-    // the claim too, so a retry starts from scratch.
-    const [min, max] = LATENCY[event.system];
-    await sleep((min + Math.random() * (max - min)) * config.latencyScale);
-    if (config.failingSystems.has(event.system) || Math.random() < config.failureRate) {
-      throw new Error(`${event.system} is temporarily unavailable`);
     }
 
     const resourceId = await perform(db, event);

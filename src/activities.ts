@@ -10,7 +10,7 @@
 // Each create activity returns the ID of the resource it created, which the
 // workflow keeps for compensation and offboarding.
 
-import { Context, log } from '@temporalio/activity';
+import { Context, log, metricMeter } from '@temporalio/activity';
 import { pool } from './db';
 import type { NewHire } from './shared';
 import { VendorOperation, VendorSystem, callVendor, idempotencyKey } from './vendors';
@@ -23,6 +23,10 @@ async function audit(employeeId: string, event: string, details: Record<string, 
      VALUES ($1, $2, $3, $4, $5) ON CONFLICT (idempotency_key) DO NOTHING`,
     [employeeId, Context.current().info.workflowExecution!.workflowId, event, details, key],
   );
+  // Every business event becomes a metric too (compensations, escalations, ...).
+  metricMeter
+    .createCounter('onboarding_events', 'events', 'Audit events recorded by activities')
+    .add(1, { event, workflow_type: Context.current().info.workflowType ?? 'unknown' });
 }
 
 async function vendorStep(
@@ -36,6 +40,9 @@ async function vendorStep(
   if (replayed) {
     // An earlier attempt succeeded at the vendor but its response never arrived.
     log.warn('Vendor returned stored response; duplicate prevented', { system, operation, resourceId });
+    metricMeter
+      .createCounter('vendor_replayed_responses', 'responses', 'Vendor calls answered from a stored idempotent response')
+      .add(1, { system });
   }
   await audit(employeeId, event, { system, resourceId, replayed });
   log.info(event, { employeeId, system, resourceId });
