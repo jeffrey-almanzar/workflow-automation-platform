@@ -1,226 +1,304 @@
-# Workflow Automation Platform with Temporal
+# Employee Onboarding Platform on Temporal
 
-**Problem:** Organizations struggle with manual internal processes that are slow and error-prone, hurting operational efficiency and increasing costs.
+A backend that automates employee onboarding and offboarding across several external systems (HR, e-signature, email, Slack, GitHub, laptop vendor, payroll). Built with **Temporal**, **NestJS** and **TypeScript**, with the external vendors running as an **AWS Lambda**, deployed to AWS with **Terraform**.
 
-**Solution:** I built a platform to automate complex workflows using Temporal and NestJS, significantly improving operational efficiency.
+The point of the project is the hard parts of backend work that a simple CRUD app never touches: processes that wait weeks for a human, steps that fail halfway through, retries that must not create duplicates, and code changes that must not break work already in progress.
 
-**Impact:** Automated 100K monthly processes, reduced manual errors by 10K instances, increasing operational efficiency by $750K per year.
+**Stack:** TypeScript · Node.js 22 · NestJS · Temporal (TypeScript SDK) · PostgreSQL · AWS Lambda, EC2, ECR, IAM, SSM · Terraform · Docker · Prometheus · Grafana · k6 · Jest
 
-**Technologies:** AWS Lambda, Temporal, NestJS, TypeScript, PostgreSQL, Docker
+## At a glance
 
-**New technologies to learn:** NestJS, Temporal
+| | |
+| --- | --- |
+| **What it does** | Runs each onboarding as a durable workflow: creates the HR record, waits for the contract signature (with a 3-day reminder and a 7-day HR escalation), provisions five systems in parallel, waits until the day before the start date, then sends the welcome email. Offboarding tears it all down. |
+| **Failure handling** | Any step can fail or the hire can be cancelled at any point; everything already done is undone in reverse order (saga pattern). Proven with tests and with the worker killed mid-process. |
+| **No duplicates** | Every external call carries an idempotency key. With the simulated vendor deliberately dropping 60% of its responses, each system still ends up with exactly one account per hire. |
+| **Tests** | 50 tests across 7 suites. Workflow tests run the real 3-day and 4-week timers in milliseconds; replay tests catch code changes that would break in-flight workflows. |
+| **Measured performance** | 10 onboardings/s sustained locally with p95 API latency of 91 ms and zero errors; the load test also found and fixed two real bugs. Results, including what didn't work, are below. |
+| **Deployed** | One `terraform apply` builds the images, creates the AWS infrastructure (EC2, Lambda, ECR, least-privilege IAM, budget alerts) and starts the stack. |
 
+![Grafana business outcomes: 907 onboardings completed, 7 rolled back, 1 escalated to HR, 246 duplicate vendor calls prevented](docs/images/grafana-business-outcomes.png)
+<sub>From the project's Grafana dashboard after a local run with injected vendor failures (5% errors, 5% lost responses): every lost response was answered from the stored result instead of creating a duplicate.</sub>
 
-## Phased plan
+## Contents
 
-1. Phase 1: Workflow design and architecture (detailed workflow documentation)
-2. Phase 2: Automation implementation with Temporal (functional prototype)
-3. Phase 3: Integration and user testing (feedback and improvement report)
-4. Phase 4: Deployment to AWS Lambda and impact analysis (efficiency/productivity dashboard)
+- [The problem](#the-problem)
+- [Quick start](#quick-start)
+- [Architecture](#architecture)
+- [How a hire flows through the system](#how-a-hire-flows-through-the-system)
+- [Engineering decisions](#engineering-decisions)
+- [Testing](#testing)
+- [Performance and load testing](#performance-and-load-testing)
+- [Observability](#observability)
+- [Deployment on AWS](#deployment-on-aws)
+- [Limitations and next steps](#limitations-and-next-steps)
+- [Repository map](#repository-map)
 
-## Explanation
+Maintainer notes (how to run, operate and explain the project): [docs/PROJECT_NOTES.md](docs/PROJECT_NOTES.md).
 
-This project consists of building a workflow automation platform using Temporal, a distributed workflow orchestration system, together with NestJS for building robust APIs. Temporal simplifies managing distributed workflows by providing execution guarantees and state persistence, which is ideal for complex internal processes that require high reliability. By integrating Temporal with NestJS, we can build a scalable backend that automates repetitive, error-prone tasks, improving operational efficiency.
+## The problem
 
-The system is made up of multiple components: a NestJS API acting as the interface for interacting with workflows, Temporal for managing workflow execution and persistence, and AWS Lambda for running serverless functions that can be invoked as part of the workflows. PostgreSQL is used as the database to store workflow state and results, while Docker is used to containerize the application and ease deployment.
+Onboarding a new employee touches many systems owned by different teams, spans weeks, and depends on people (the hire signs a contract, the start date moves, an offer gets withdrawn). In practice it runs on spreadsheets and tickets, so steps get missed: people start without a laptop or login, and people who never joined (or have left) keep access to company systems.
 
-This project covers several key concepts, including distributed workflow orchestration, real-time state management, and the use of serverless technologies to scale applications. 
+Automating it is harder than it looks:
+
+- **It waits on humans for days or weeks.** A normal request/response backend would need status tables, cron jobs scanning for overdue work, and locking.
+- **It spans systems with no shared transaction.** If payroll enrollment fails after the email account and laptop order succeeded, there is no `ROLLBACK`.
+- **Calls fail in ambiguous ways.** A timeout doesn't say whether the account was created, and a blind retry can create a second one.
+- **The process changes while instances are running.** Editing the code must not corrupt an onboarding that started last week.
+
+This project addresses each of these explicitly. The vendors are simulated (an AWS Lambda with its own database, realistic latency and injectable failures), so every failure mode can be reproduced on demand.
+
+## Quick start
+
+Requires Docker.
+
+```bash
+docker compose up -d --build
+
+# Start an onboarding (start date 2 hours out, so it completes right after provisioning)
+START=$(date -u -v+2H +%Y-%m-%dT%H:%M:%SZ)   # macOS; on Linux: date -u -d '+2 hours' +%Y-%m-%dT%H:%M:%SZ
+curl -X POST localhost:3000/onboardings -H 'Content-Type: application/json' \
+  -d "{\"employeeId\":\"E1\",\"fullName\":\"Ana López\",\"personalEmail\":\"ana@example.com\",\"role\":\"engineer\",\"startDate\":\"$START\"}"
+
+curl -X POST localhost:3000/onboardings/onboarding-E1/contract-signature   # the hire signs
+curl localhost:3000/onboardings/onboarding-E1                              # live progress
+curl localhost:3000/employees/E1                                           # record + audit trail
+```
+
+| Local URL | What |
+| --- | --- |
+| http://localhost:3000 | API |
+| http://localhost:8080 | Temporal UI: every workflow's full event history |
+| http://localhost:3001 | Grafana dashboard (no login) |
+| http://localhost:9090 | Prometheus |
+
+To see failures and recovery (worker crashes, vendor outages, lost responses, cancellations), follow the scenarios in [docs/PROJECT_NOTES.md](docs/PROJECT_NOTES.md#demo-scenarios). After running them, the Temporal UI looks like this:
+
+![Temporal UI workflow list: one onboarding still waiting for a signature, six completed (including one cancelled and an offboarding) and one failed](docs/images/temporal-workflow-list.png)
+
+A cancelled onboarding shows as *Completed* in Temporal: cancellation is a business outcome, and the workflow's own status (`CANCELLED`) is in `GET /onboardings/:id`.
 
 ## Architecture
 
-```
-[Client] --> [NestJS API] --> [Temporal Service] --> [AWS Lambda]
-                     |                  |
-                  [PostgreSQL]        [Worker]
-```
-- **Client**: Interacts with the API to start and monitor workflows.
-- **NestJS API**: Exposes REST endpoints to manage workflows; talks to the Temporal Service to start and monitor them.
-- **Temporal Service**: Orchestrates workflow execution, manages state, and guarantees execution.
-- **AWS Lambda**: Runs serverless functions as part of the workflows, enabling efficient scalability.
-- **PostgreSQL**: Stores persistent workflow data and results.
-- **Worker**: Executes the tasks defined in the workflows, interacting with the Temporal Service.
+![Architecture: the client calls the NestJS API, which starts, signals and queries workflows on the Temporal server; the worker polls Temporal, writes records and audit events to PostgreSQL, and invokes the vendors Lambda with an idempotency key; Temporal, the app and the vendors each keep their data in PostgreSQL](docs/diagrams/architecture.svg)
 
-## How it works
-
-This section walks through what actually runs today in `src/`, end to end.
-
-### The moving pieces
-
-| File | Role |
+| Component | Role |
 | --- | --- |
-| [src/main.ts](src/main.ts) | Boots the NestJS app and starts listening on port 3000. |
-| [src/app.module.ts](src/app.module.ts) | Root module; wires `WorkflowController` and `TemporalService` together. |
-| [src/workflow.controller.ts](src/workflow.controller.ts) | HTTP layer: `POST /workflow/start` and `GET /workflow/:id/status`. |
-| [src/temporal.service.ts](src/temporal.service.ts) | Temporal **client**: opens a connection to the Temporal server and asks it to start/describe workflows. |
-| [src/workflows.ts](src/workflows.ts) | The actual workflow logic (`exampleWorkflow`), executed by the worker, not by the NestJS process. |
-| [src/activities.ts](src/activities.ts) | Activities — the "do real work" steps a workflow calls out to (here, a simple `greet`). |
-| [src/worker.ts](src/worker.ts) | A separate Node process that polls Temporal for work and executes `workflows.ts`/`activities.ts`. |
+| **NestJS API** | REST endpoints. Talks to Temporal as a client only: starts workflows, sends signals, reads state. Never runs workflow code. |
+| **Temporal server** | Stores every workflow's state and history, schedules timers and retries, dispatches tasks to workers. |
+| **Worker** | A separate Node process that executes the workflow and activity code. If it crashes, Temporal resumes the work on the next worker that connects. |
+| **Vendors Lambda** | Simulates the six external SaaS systems, with its own state and idempotency-key handling like a real vendor API. The same container image runs locally and on AWS Lambda. |
+| **PostgreSQL** | Our system of record (employees, audit log), the vendors' simulated data (separate schema), and Temporal's persistence (separate databases). |
 
-Two independent Node processes come out of this codebase:
-- **`app`** — the NestJS HTTP API (talks to Temporal as a *client*, never runs workflow code itself).
-- **`worker`** — polls Temporal and *executes* the workflow/activity code.
+The API and worker are separate processes on purpose: workflow code must be deterministic (Temporal replays it to rebuild state), and the two scale independently.
 
-They never call each other directly; Temporal is the broker in between. This separation is what gives Temporal its durability: if the worker crashes mid-workflow, Temporal remembers exactly where it was and resumes on another worker once one reconnects.
+## How a hire flows through the system
 
-### Request lifecycle: starting a workflow
+![Onboarding workflow: create HR record, send contract, wait for the signature with a reminder after 3 days and HR escalation after 7, provision email, Slack, GitHub, laptop and payroll in parallel, sleep until the day before the start date (rescheduled by the updateStartDate signal), send the welcome email and activate the employee; a cancel signal or a permanent failure leads to the saga rollback](docs/diagrams/onboarding-flow.svg)
 
-1. A client sends `POST /workflow/start`.
-2. `WorkflowController.startWorkflow()` delegates to `TemporalService.startWorkflow()`.
-3. `TemporalService` calls `client.start('exampleWorkflow', { taskQueue: 'exampleTaskQueue', workflowId, args })` on its `WorkflowClient`. This is a request to the Temporal **server** — it just records "please run this workflow" and returns immediately with a `workflowId`. No business logic has executed yet.
-4. Temporal places a workflow task on the `exampleTaskQueue`.
-5. The `worker` process, which has been polling that same task queue since startup, picks up the task and runs `exampleWorkflow(name)` from `workflows.ts`.
-6. Inside the workflow, `proxyActivities` schedules the `greet` activity. Temporal dispatches that as an *activity task*, also on `exampleTaskQueue`, which the same worker executes.
-7. `greet` runs and returns a string; the workflow returns that string as its result; the worker reports completion back to Temporal.
-8. The NestJS API never has to do anything else here — all of this happens asynchronously, driven by the worker and the Temporal server.
+Offboarding (`POST /offboardings`) waits until the requested time, cuts access first (email, Slack, GitHub in parallel), then payroll and laptop return, and archives the HR record last. Anything that still fails after retries is escalated to HR rather than silently left behind.
 
-### Request lifecycle: checking status
+### API
 
-1. A client sends `GET /workflow/:id/status`.
-2. `WorkflowController.getStatus()` delegates to `TemporalService.getWorkflowStatus(id)`.
-3. `TemporalService` calls `client.getHandle(id).describe()`, which asks the Temporal server for that workflow's current execution state (`RUNNING`, `COMPLETED`, `FAILED`, etc.) plus metadata like start time and history length.
-4. Temporal answers from its own persisted state (backed by PostgreSQL) — it doesn't need to contact the worker to answer this.
+| Endpoint | Behavior |
+| --- | --- |
+| `POST /onboardings` | Starts an onboarding. `202` with the ID, `409` if one is already running for that employee, `400` on invalid input. |
+| `GET /onboardings/:id` | Live progress: phase, % complete, each step's status, contract state, created resource IDs. |
+| `POST /onboardings/:id/contract-signature` | Signal: contract signed (in production, the e-signature provider's webhook). Safe to send twice. |
+| `PATCH /onboardings/:id/start-date` | Signal: new start date; the waiting workflow reschedules itself. |
+| `POST /onboardings/:id/cancellation` | Signal: cancel with a reason; triggers the rollback. |
+| `POST /offboardings` · `GET /offboardings/:id` | Start (only for a completed onboarding) and track an offboarding. |
+| `GET /employees/:id` | Employee record and full audit trail from PostgreSQL. |
+| `GET /health` · `GET /metrics` | Liveness check · Prometheus metrics. |
 
-### Why a separate worker process?
+Signals to an unknown workflow return `404`; to one that has already finished, `409`.
 
-Workflow code has to be deterministic (same inputs always produce the same sequence of decisions) because Temporal may replay it to rebuild state after a crash. Activities are where non-deterministic, "real" work happens — I/O, API calls, timestamps. Splitting workflow/activity execution into its own `worker` process (rather than running it inside the NestJS app) keeps the HTTP API free to scale independently, and lets you run many worker instances pulling from the same task queue without touching the API layer at all.
+## Engineering decisions
 
-### Local topology
+### Waiting on people: signals and durable timers
 
-Running `docker compose up` starts four containers that map directly onto the pieces above:
+The contract and start-date waits are ordinary code, not cron jobs or status polling:
 
-```
-app (NestJS, :3000) ──Temporal client──▶ temporal (:7233) ◀──polls── worker
-                                              │
-                                         postgres (:5432)
+```ts
+if (!(await condition(signed, '3 days'))) {   // returns early if the signal arrives
+  await acts.sendContractReminder(hire);
+  ...
+}
 ```
 
-## Local environment (cloud simulation)
+- Timers are stored by the Temporal server, not held in memory. Nothing runs while waiting, and a wait survives crashes and deploys: with the worker stopped past both deadlines, the reminder and escalation fired as soon as it restarted.
+- Signal handlers only record the event; the main flow decides what to do. A start-date change wakes the sleeping workflow, which recomputes the timer.
+- Timings are passed as workflow input rather than read from config inside the workflow. They are recorded in history, so changing the config never alters onboardings already running.
 
-To emulate the project's cloud environment, we use Docker Compose to spin up the required services locally. This includes Temporal, PostgreSQL, and the NestJS application.
+An onboarding whose contract went unsigned, run with demo timers of 20 seconds instead of days (Temporal lists events newest first): timer, reminder, timer, HR escalation, then the signature arrives and provisioning starts.
 
-1. We emulate Temporal and PostgreSQL using Docker Compose.
-2. Run `docker compose up` in the root directory to start the services (`docker compose down` to stop them).
-3. The NestJS app will be available at `http://localhost:3000` and Temporal at `localhost:7233`.
-4. Make sure environment variables point to these local endpoints to test the application.
-5. Verify everything works by hitting `http://localhost:3000/workflow/start` to kick off a workflow.
+![Temporal event history for an onboarding: createHrRecord, sendContract, a 20s timer, sendContractReminder, another 20s timer, escalateToHr, the contractSigned signal, then the provisioning activities with their resource IDs, the welcome email and activateEmployee](docs/images/temporal-reminder-escalation.png)
 
-## Cloud deployment
+### Undoing work across systems: the saga pattern
 
-To deploy the application to the cloud, follow these steps:
+There is no transaction spanning Slack, payroll and a laptop vendor. Every step with a side effect has a matching undo, registered as soon as the side effect exists, and on cancellation or permanent failure the workflow runs the undos in reverse order of completion.
 
-1. Configure the AWS CLI with your AWS credentials.
-2. Use Terraform to define the required infrastructure, including AWS Lambda and PostgreSQL RDS.
-3. Run `terraform init` and `terraform apply` to provision the infrastructure.
-4. Upload the application code to AWS Lambda using `aws lambda update-function-code`.
-5. Make sure the environment variables in AWS Lambda point to the right services.
-6. Verify the application is running correctly by hitting the production endpoints.
+![Saga: forward steps HR record, contract, email, Slack, laptop, payroll, then GitHub fails after 5 attempts and triggers the rollback, which removes payroll, cancels the laptop order, deactivates Slack and email, voids the contract and archives the HR record, escalating anything that still fails to HR](docs/diagrams/saga.svg)
 
-## Load testing
+Decisions that matter:
 
-We use k6, an open-source load testing tool, to run load tests.
+- **A cancel interrupts waits immediately, but lets in-flight calls finish.** Interrupting a call that actually succeeded at the vendor would leave an account the rollback doesn't know about. Calls in progress complete (`Promise.allSettled`), then everything that succeeded is undone. A test sends the cancel while a vendor call is blocked mid-flight and checks that the resulting account is still cleaned up.
+- **Undos are more persistent than forward steps** (10 attempts, backoff capped at 1 minute, versus 5). One that still fails doesn't block the others; it is flagged and escalated to HR for manual cleanup.
+- **Irreversible steps go last.** The welcome email can't be unsent, so it is the final step.
+- **The rollback runs in a non-cancellable scope**, so it completes even if an operator cancels the workflow directly in Temporal.
+- **A cancellation is a business outcome, not an error**: the workflow completes with status `CANCELLED`; only real failures end as `FAILED`.
 
-1. Define a load test script in `loadtest/k6.js` with p95/p99 thresholds.
-2. Run `k6 run loadtest/k6.js` to start the load test.
-3. Configure Prometheus and Grafana to observe the load test results.
-4. Monitor performance metrics and adjust infrastructure as needed.
+Offboarding reuses the same undo operations, starting from the resource IDs the onboarding recorded.
 
-## Target metrics
+**In the Temporal UI.** A hire cancelled while waiting for the start date (newest events first). Read from the bottom: the forward steps with the resource IDs they created, the start-date timer, the `cancelOnboarding` signal with its reason, then every undo. The provisioning steps finished in the order GitHub, email, Slack, payroll, laptop; the undos run laptop, payroll, Slack, email, GitHub, then the contract and the HR record:
 
-| Metric | Target | How to measure |
-| --- | --- | --- |
-| Target QPS / RPS | 2,000 sustained req/s | Measured with k6 and monitored with Prometheus. |
-| p50 / p95 / p99 latency | p99 < 200ms | Latency metrics measured with k6 and visualized in Grafana. |
-| Error rate | < 0.1% | Measured with k6 by observing http_req_failed. |
-| Saturation point | Degradation starting around ~3,500 req/s | Observed during load testing with k6. |
+![Temporal event history of a cancelled onboarding: provisioning results, the start-date timer, the cancelOnboarding signal with reason "Candidate accepted another offer", then cancelLaptopOrder, removeFromPayroll, deactivateSlackAccount, deactivateEmailAccount, revokeGithubAccess, voidContract and archiveHrRecord](docs/images/temporal-cancelled-saga.png)
 
-## Tests (unit / integration)
+And a vendor outage: GitHub keeps failing (the red bar is about 17 seconds of retries with backoff), the workflow gives up, and the completed steps are rolled back:
 
-To ensure code quality, we implement unit and integration tests.
+![Temporal timeline of a failed onboarding: grantGithubAccess failing for about 17 seconds of retries, followed by cancelLaptopOrder, removeFromPayroll and the other compensations](docs/images/temporal-outage-rollback.png)
 
-Example unit test for `TemporalService`:
-```typescript
-import { Test, TestingModule } from '@nestjs/testing';
-import { TemporalService } from './temporal.service';
+### Retries without duplicates: idempotency keys
 
-describe('TemporalService', () => {
-  let service: TemporalService;
+Temporal retries failed calls automatically, which raises the classic problem: what if the call succeeded but the response was lost? A naive retry creates `ana.lopez2@company.com` next to an orphaned `ana.lopez@`.
 
-  beforeEach(async () => {
-    const module: TestingModule = await Test.createTestingModule({
-      providers: [TemporalService],
-    }).compile();
+- **The caller sends a key that is the same on every retry of a call and different for every other call** (`<workflow run ID>:<activity ID>`). A rehire is a new workflow run, so it correctly gets new keys.
+- **The vendor claims the key before doing the work, and stores the response in the same database transaction as the work.** A repeated key gets the stored response back. Two identical requests arriving together: the second waits on the key until the first commits, then returns its result, so a duplicate never even starts the work.
+- **Our own writes are idempotent too**: employee records are upserts, and audit entries are keyed per call.
+- **Retries happen in exactly one place.** The AWS SDK's built-in retries are disabled so Temporal's policy is the only one, and every attempt is visible in the workflow history.
 
-    service = module.get<TemporalService>(TemporalService);
-  });
+Verified by making the vendor drop 60% of its responses after doing the work: 5 responses lost, 5 retries answered from the stored result, exactly one resource per system.
 
-  it('should be defined', () => {
-    expect(service).toBeDefined();
-  });
+### Duplicate requests and degraded reads
 
-  it('should start a workflow', async () => {
-    const workflowId = await service.startWorkflow();
-    expect(workflowId).toBeDefined();
-  });
-});
+- **Duplicate submissions are rejected by Temporal itself**: the workflow ID is derived from the employee ID, so a second onboarding for the same person returns `409` with no extra table or lock.
+- **Progress is read from the workflow's own state** (a Temporal query), so there is no status table to keep in sync. If no worker answers within 3 seconds, the endpoint returns the server-side status instead of hanging.
+
+### Changing code safely: workflow versioning
+
+Temporal rebuilds a workflow's state by replaying its history through the current code. A change like adding a step before an existing one would break every onboarding already in progress. Recorded histories are replayed against the code in CI-style tests; such a change fails them with a determinism error, signalling that it needs Temporal's `patched()` versioning instead of an in-place edit.
+
+### Local and cloud from the same artifacts
+
+The vendors Lambda is a container image built on AWS's official Lambda base image. Locally the worker reaches it through the same AWS SDK call, pointed at a local endpoint; on AWS the endpoint is unset and the SDK calls real Lambda. AWS's local Lambda emulator handles only one invocation at a time (and crashes on concurrent ones), so locally the image runs a small server exposing the same Invoke API, forked into several processes the way Lambda scales out.
+
+## Testing
+
+```bash
+npm test                   # 42 unit and workflow tests, no external services (~15s)
+npm run test:integration   # 8 tests against the docker-compose Postgres
 ```
 
-For integration tests, it's recommended to use a test environment that emulates the full infrastructure.
+| Suite | What it proves |
+| --- | --- |
+| Onboarding workflow (12) | Happy path, role-based steps, reminder and escalation timers, start-date changes, retries, and every rollback path: cancel at each stage, cancel during an in-flight call, permanent failure, failing undo, cancel issued through Temporal. |
+| Offboarding workflow (3) | Scheduled revocation, phase ordering, skipping resources never created, escalation on failure. |
+| Replay (2 histories) | Recorded histories still replay against the current code. |
+| API (11) | Validation and routing with the production app configuration. |
+| Temporal service (10) | Temporal errors and states mapped to `404`/`409`; degraded progress when no worker responds. |
+| Vendor client (3) | Idempotency keys stable across retries, unique per call and per run; Lambda errors surface as retryable failures. |
+| Vendor Lambda, integration (8) | Against real Postgres: repeated keys, lost responses, five simultaneous identical requests, same-name address allocation, idempotent deactivation. |
 
-## Technical complexities
+- **Time skipping:** workflow tests run against Temporal's test server with the real production timings; it jumps ahead whenever the workflow is only waiting, so the 7-day escalation and 4-week start-date wait take milliseconds. Tests assert *when* things happen on the workflow clock (e.g. the welcome email exactly one day before a rescheduled start date).
+- **The tests were checked by breaking the code on purpose:** undoing steps in forward order fails 4 tests; inserting a new activity call fails both replay tests with Temporal's nondeterminism error.
 
-### Distributed workflow orchestration
+## Performance and load testing
 
-**Why it's hard:** Managing the state and execution of distributed workflows is complex because it requires guaranteeing consistency and fault tolerance.
+[k6](loadtest/k6.js) drives full hires (start, sign, sometimes read progress), so every request triggers the whole workflow including parallel vendor calls. Measured locally on an Apple M1 Pro (Docker Desktop, 10 CPUs), single-node Temporal with Postgres, one worker, simulated vendor latency of 0.1–2 s per call, 2-minute constant-rate runs:
 
-**How it's solved:** Temporal automatically handles state persistence and re-execution on failure, letting you focus on business logic.
+| Hires/s offered | Completed/s | API p95 / p99 | Onboarding end-to-end p95 | Backlog after run |
+| --- | --- | --- | --- | --- |
+| **10** | **10.0** | **91 ms / 221 ms** | **4.9 s** | **0** |
+| 15 | 10.6 | 166 ms / 527 ms | 41 s | 230 |
+| 20 | 7.6 | 373 ms / 1.7 s | 69 s | 1,275 |
+| 25 | 5.0 | 1.0 s / 3.0 s | 90 s | 2,330 |
 
-### Serverless function scalability
+- **About 10 onboardings/s sustained** (roughly 25 API requests/s, 90 vendor calls/s and 100 workflow tasks/s) with zero errors across all runs.
+- **Past ~11/s, throughput drops instead of levelling off.** The API keeps accepting work, so overload shows up as growing queues rather than errors. A production version needs backpressure (e.g. `429` when queueing latency is high).
 
-**Why it's hard:** Serverless functions need to scale dynamically to handle variable load without hurting performance.
+**What load testing found:**
 
-**How it's solved:** AWS Lambda is used to run serverless functions that scale automatically in response to load.
+1. **A real bug in the vendor:** email addresses were allocated by checking candidates one query at a time inside a transaction. With many hires sharing a name, each call ran thousands of queries, starved the connection pool and slowed *every* vendor call to 4–7 s. Replaced with a single query, with tests.
+2. **A limitation of the local setup:** the local Lambda stand-in ran in one process and pinned a core; it now forks several, like Lambda scaling out.
+3. **An unresolved ceiling:** once those were fixed, none of 3 workers, 500 activity slots, 50 pollers, 64 history shards or disabling Postgres disk flushes raised the ~10/s limit, and no container was CPU-bound. The data points at task dispatch inside the single-node Temporal server; the exact cause is not identified yet. The investigation, including the hypotheses that turned out wrong, is in [docs/PROJECT_NOTES.md](docs/PROJECT_NOTES.md#load-test-investigation).
 
-### Real-time state management
+## Observability
 
-**Why it's hard:** Keeping state up to date and consistent in real time is challenging in distributed systems.
+Prometheus and Grafana run locally alongside the stack, with a provisioned dashboard ([monitoring/](monitoring/)):
 
-**How it's solved:** Temporal provides a robust mechanism for managing workflow state, enabling real-time updates.
+- **Business outcomes:** onboardings completed and rolled back, HR escalations, duplicates prevented by idempotency.
+- **API:** throughput by route, p50/p95/p99 latency, responses by status.
+- **Saturation signals:** workflow completions, activity latency and failures by type, queueing (schedule-to-start) latency, worker slots, Temporal persistence latency.
 
+Metrics come from the API (`prom-client`), the worker (Temporal SDK exporter plus custom counters for every audit event and every replayed vendor response) and the Temporal server. Every action is also written to an audit log in PostgreSQL, exposed at `GET /employees/:id`.
 
-## Takeaways
+<details>
+<summary><b>The full dashboard</b> after a 3-minute run at 5 hires/s with injected vendor failures</summary>
 
-- Implemented a workflow automation platform using Temporal and NestJS.
-- Learned to orchestrate distributed workflows with Temporal.
-- Got familiar with deploying applications to AWS Lambda.
-- Developed skills for load testing and monitoring performance metrics.
-- Built a local development environment that emulates the cloud infrastructure.
+![Grafana dashboard: business outcomes and events per minute; API requests, latency percentiles and status codes; workflow completions, activity latency and failures by type, queueing delay, worker slots and Temporal persistence latency](docs/images/grafana-dashboard.png)
 
-## Learning path
+The spike at the right edge is about 900 onboardings released at once (their start dates moved to today with a single batch signal): completions jump to about 15/s while queueing delay rises to about 20 s, the same saturation pattern measured in the load tests. Some counters undercount the first event of a new series, a known Prometheus behavior on low traffic.
 
-### NestJS
+</details>
 
-NestJS is a progressive Node.js framework for building efficient, scalable server-side applications with TypeScript, built around modules, controllers, and providers with dependency injection.
+## Deployment on AWS
 
-1. Start with the official NestJS documentation to understand modules, controllers, and providers.
-2. Build a simple NestJS controller/service pair and wire it up with dependency injection.
-3. Integrate Temporal into a NestJS service (as done in `temporal.service.ts`) to manage workflows.
-4. Deploy the NestJS application in a Docker environment to simulate its integration into the project.
-5. Experiment with NestJS features like pipes, guards, interceptors, and custom modules.
+Everything is in [infra/](infra/) (Terraform). One `terraform apply` builds and pushes both images, creates the infrastructure and boots the stack.
 
-- NestJS Documentation
-- NestJS Courses (official)
-- Awesome NestJS (community resources)
+![AWS deployment: your IP reaches the API on an EC2 t4g.small running the API, worker, Temporal and PostgreSQL with docker compose; the worker invokes the vendors Lambda in the same VPC, which reaches PostgreSQL through its security group; ECR, SSM, CloudWatch Logs, IAM roles and Budgets support it; Terraform provisions everything](docs/diagrams/aws-deployment.svg)
 
-### Temporal
+| Concern | Choice |
+| --- | --- |
+| Compute | One EC2 instance (ARM, 2 GB) running the same containers as locally. The Temporal server and worker are long-running processes, so they don't fit Lambda; the vendor calls do. |
+| Security | API open only to the deployer's IP. No SSH port: shell access and the Temporal UI go through SSM Session Manager. IMDSv2 required. IAM roles grant only what is used (invoke one Lambda, read one parameter, pull images). Database password generated by Terraform, stored encrypted in SSM Parameter Store, never in user data or git. |
+| Cost | About $17/month. Two budget alerts by email: any charge not covered by credits, and forecast usage above $25/month. `terraform destroy` removes everything. |
+| Updates | `terraform apply` rebuilds only images whose sources changed and updates the Lambda; `infra/scripts/redeploy.sh` rolls the new images onto the host through SSM without replacing it or its data. |
 
-Temporal enables building resilient distributed systems with persistent state management.
+### Running on AWS
 
-1. Read the Temporal documentation to understand its architecture and key concepts.
-2. Implement a simple workflow in Temporal using TypeScript.
-3. Integrate Temporal with NestJS and test orchestration of complex workflows.
-4. Deploy Temporal in a Docker environment and test its behavior with k6.
-5. Explore advanced use cases and recommended design patterns in Temporal.
+Every resource Terraform creates is tagged `Project = onboarding`, so the whole deployment shows up as one resource group:
 
-- Temporal Documentation
-- Temporal.io YouTube Channel
-- Building Workflows with Temporal by Maxim Fateev
+![AWS resource group listing the 13 regional resources of the deployment: the SSM parameter, Lambda log group, vendors Lambda, two ECR repositories, security groups and rules, and the EC2 instance](docs/images/aws-resource-group.png)
+
+The EC2 host running the stack (ARM `t4g.small`, all status checks passing):
+
+![EC2 console showing the onboarding-app instance running as a t4g.small with 3/3 status checks passed](docs/images/aws-ec2.png)
+
+The vendors Lambda after one onboarding against the cloud API: 7 vendor calls (contract, five provisioning steps, welcome email), 0 errors, 100% success. Durations of 144 ms to 1.8 s are the simulated vendor latency:
+
+![Lambda Monitor tab for onboarding-vendors: 7 invocations, average duration 990 ms, 0 errors and 100% success rate](docs/images/aws-lambda-monitor.png)
+
+![Recent invocations of onboarding-vendors in CloudWatch Logs, with request IDs, log streams and durations](docs/images/aws-lambda-logs.png)
+
+Step-by-step instructions are in [docs/PROJECT_NOTES.md](docs/PROJECT_NOTES.md#deploying-to-aws).
+
+## Limitations and next steps
+
+Deliberate scope limits for a portfolio project, and what a production version would add:
+
+- **Single-node, self-hosted Temporal on one EC2 instance.** Production would use Temporal Cloud or a multi-node cluster with a managed database (RDS), and run API and workers on ECS or Kubernetes behind a load balancer.
+- **No authentication on the API**; access is restricted by IP. Production needs authentication and authorization (e.g. who may cancel an onboarding).
+- **No backpressure.** Overload becomes latency rather than a `429`.
+- **The throughput ceiling is not explained yet** (see the load testing section).
+- **Vendors are simulated.** Real integrations would add webhooks (e.g. the e-signature provider calling the signature endpoint), API credentials in Secrets Manager, and vendor rate limits.
+- **No CI pipeline yet.** The tests are ready to run in one (unit tests need nothing external).
+
+## Repository map
+
+| Path | Contents |
+| --- | --- |
+| [src/workflows.ts](src/workflows.ts) | `onboardingWorkflow` and `offboardingWorkflow`: the orchestration, saga and timers |
+| [src/activities.ts](src/activities.ts) | One activity per external operation plus its undo; database writes and audit events |
+| [src/vendors.ts](src/vendors.ts) | Lambda client and idempotency-key derivation |
+| [src/temporal.service.ts](src/temporal.service.ts) | Temporal client: start, signal, query; maps Temporal errors to HTTP |
+| [src/*.controller.ts](src/) | REST endpoints and request validation |
+| [src/worker.ts](src/worker.ts) | Worker process and metrics exporter |
+| [lambdas/vendors/](lambdas/vendors/) | The vendors Lambda: handler, container image, local Invoke-API server |
+| [test/](test/) | Workflow, replay, API and integration tests; recorded histories |
+| [infra/](infra/) | Terraform for AWS |
+| [monitoring/](monitoring/) | Prometheus config and Grafana dashboard |
+| [loadtest/k6.js](loadtest/k6.js) | Load test |
+| [docs/PROJECT_NOTES.md](docs/PROJECT_NOTES.md) | Maintainer notes: running, operating, explaining the project |
+| [docs/diagrams/](docs/diagrams/) | Diagram sources ([D2](https://d2lang.com)); `npm run docs:diagrams` regenerates the SVGs |
+| [docs/images/](docs/images/) | Screenshots of the Temporal UI, Grafana and the AWS console |

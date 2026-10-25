@@ -1,0 +1,28 @@
+# Saga: forward steps and their compensations. Render with: npm run docs:diagrams
+direction: down
+grid-columns: 2
+grid-gap: 120
+
+forward: "1. Forward steps (in completion order)" {
+  hr: HR record
+  contract: Contract sent
+  email: Email account
+  slack: Slack account
+  laptop: Laptop ordered
+  payroll: Payroll
+  github: "GitHub ✗  fails after 5 attempts" {style.stroke: "#d9480f"; style.stroke-width: 3}
+  hr -> contract -> email -> slack -> laptop -> payroll -> github
+}
+
+undo: "2. Compensations (reverse order)" {
+  payroll: Remove from payroll
+  laptop: Cancel laptop order
+  slack: Deactivate Slack
+  email: Deactivate email
+  contract: Void contract
+  hr: Archive HR record
+  escalate: "Escalate to HR (anything that still fails)" {shape: hexagon}
+  payroll -> laptop -> slack -> email -> contract -> hr -> escalate
+}
+
+forward.github -> undo.payroll: triggers rollback {style.stroke: "#d9480f"; style.stroke-dash: 3}

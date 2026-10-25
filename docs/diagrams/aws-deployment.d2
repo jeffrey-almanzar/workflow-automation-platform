@@ -1,0 +1,57 @@
+# AWS deployment (Terraform in infra/). Render with: npm run docs:diagrams
+direction: right
+
+you: "You\n(allowed IP only)" {
+  shape: person
+}
+
+terraform: "Terraform\nbuild · push · provision" {
+  shape: hexagon
+}
+
+aws: AWS · us-east-2 {
+  vpc: Default VPC {
+    direction: right
+    icon: https://icons.terrastruct.com/aws%2FNetworking%20%26%20Content%20Delivery%2FAmazon-VPC.svg
+
+    ec2: "EC2 t4g.small · docker compose" {
+      direction: down
+      icon: https://icons.terrastruct.com/aws%2FCompute%2FAmazon-EC2.svg
+      api: NestJS API
+      temporal: Temporal + UI
+      worker: Worker
+      postgres: PostgreSQL {shape: cylinder}
+      api -> temporal
+      worker -> temporal
+    }
+
+    lambda: Vendors Lambda {
+      icon: https://icons.terrastruct.com/aws%2FCompute%2FAWS-Lambda.svg
+    }
+  }
+
+  services: Account services {
+    grid-columns: 1
+    ecr: "ECR · images" {
+      icon: https://icons.terrastruct.com/aws%2FCompute%2FAmazon-EC2-Container-Registry.svg
+    }
+    ssm: "SSM · password, shell, UI tunnel" {
+      icon: https://icons.terrastruct.com/aws%2FManagement%20%26%20Governance%2FAWS-Systems-Manager.svg
+    }
+    logs: "CloudWatch Logs" {
+      icon: https://icons.terrastruct.com/aws%2FManagement%20%26%20Governance%2FAmazon-CloudWatch.svg
+    }
+    iam: "IAM roles · least privilege" {
+      icon: https://icons.terrastruct.com/aws%2FSecurity%2C%20Identity%2C%20%26%20Compliance%2FAWS-Identity-and-Access-Management-IAM_Role_light-bg.svg
+    }
+    budgets: "Budgets · email alerts" {
+      icon: https://icons.terrastruct.com/aws%2FAWS%20Cost%20Management%2FAWS-Budgets.svg
+    }
+  }
+}
+
+you -> aws.vpc.ec2.api: ":3000, your IP only"
+terraform -> aws: apply
+aws.vpc.ec2.worker -> aws.vpc.lambda: lambda:InvokeFunction
+aws.vpc.lambda -> aws.vpc.ec2.postgres: ":5432, Lambda SG only"
+aws.vpc.ec2 -> aws.services: "pull images · read password" {style.stroke-dash: 3}

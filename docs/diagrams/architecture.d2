@@ -1,0 +1,36 @@
+# System architecture. Render with: npm run docs:diagrams
+direction: right
+
+client: Client {
+  shape: person
+}
+
+api: "NestJS API\nREST: start · signal · query" {
+}
+
+temporal: "Temporal Server\nstate · durable timers · retries" {
+  style.stroke-width: 3
+}
+
+worker: "Worker\nworkflow + activity code" {
+}
+
+vendors: "Vendors Lambda\ne-signature · email · Slack\nGitHub · laptop · payroll" {
+  icon: https://icons.terrastruct.com/aws%2FCompute%2FAWS-Lambda.svg
+}
+
+postgres: PostgreSQL {
+  icon: https://icons.terrastruct.com/dev%2Fpostgresql.svg
+  app: "app schema\nemployees · audit_log" {shape: cylinder}
+  temporal_db: "Temporal databases\nworkflow histories" {shape: cylinder}
+  vendors_db: "vendors schema\nresources · idempotency keys" {shape: cylinder}
+}
+
+client -> api: HTTP
+api -> temporal: start · signal · query
+worker -> temporal: polls for tasks {style.animated: false}
+worker -> vendors: invoke with idempotency key
+worker -> postgres.app: records · audit events
+api -> postgres.app: reads
+temporal -> postgres.temporal_db: persists
+vendors -> postgres.vendors_db: claim key + do work\nin one transaction

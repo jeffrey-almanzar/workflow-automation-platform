@@ -3,3 +3,9 @@ dist
 npm-debug.log
 .git
 .devcontainer
+# Not needed in the app image (and infra/.terraform holds large provider binaries)
+infra
+lambdas
+test
+loadtest
+monitoring

@@ -19,14 +19,35 @@ services:
       POSTGRES_SEEDS: postgres
       TEMPORAL_CLI_ADDRESS: 'temporal:7233'
       TEMPORAL_CLI_PORT: '7233'
+      PROMETHEUS_ENDPOINT: '0.0.0.0:8000' # server metrics, scraped by prometheus
+      # Each history shard serializes its writes. The count is fixed when the
+      # database is created, so a different count needs a different database,
+      # e.g. TEMPORAL_HISTORY_SHARDS=64 TEMPORAL_DB=temporal_64.
+      NUM_HISTORY_SHARDS: '${TEMPORAL_HISTORY_SHARDS:-4}'
+      DBNAME: '${TEMPORAL_DB:-temporal}'
+      VISIBILITY_DBNAME: '${TEMPORAL_DB:-temporal}_visibility'
     depends_on:
       - postgres
+  temporal-ui:
+    image: temporalio/ui:2.26.2
+    ports:
+      - '8080:8080'
+    environment:
+      TEMPORAL_ADDRESS: 'temporal:7233'
+    depends_on:
+      - temporal
   app:
     build: .
     ports:
       - '3000:3000'
     environment:
       TEMPORAL_ADDRESS: 'temporal:7233'
+      DATABASE_URL: 'postgres://user:password@postgres:5432/workflows'
+      # Shorten the human-step timers for local demos, e.g. CONTRACT_REMINDER_DELAY="30 seconds".
+      # Empty = production defaults (3 days / 4 more days / 1 day before start).
+      CONTRACT_REMINDER_DELAY: '${CONTRACT_REMINDER_DELAY:-}'
+      CONTRACT_ESCALATION_DELAY: '${CONTRACT_ESCALATION_DELAY:-}'
+      WELCOME_LEAD_TIME: '${WELCOME_LEAD_TIME:-}'
     depends_on:
       - postgres
       - temporal
@@ -36,7 +57,68 @@ services:
     command: ['node', 'dist/worker']
     environment:
       TEMPORAL_ADDRESS: 'temporal:7233'
+      DATABASE_URL: 'postgres://user:password@postgres:5432/workflows'
+      # Local Lambda Invoke API. On AWS, leave LAMBDA_ENDPOINT unset and set
+      # VENDOR_FUNCTION_NAME to the deployed function's name.
+      LAMBDA_ENDPOINT: 'http://vendors:8080'
+      VENDOR_FUNCTION_NAME: 'function'
+      AWS_REGION: 'us-east-1'
+      AWS_ACCESS_KEY_ID: 'local' # the emulator ignores credentials, but the SDK requires some
+      AWS_SECRET_ACCESS_KEY: 'local'
+      # Cap on workflows cached in memory; set it on small hosts. Empty = SDK default.
+      WORKER_MAX_CACHED_WORKFLOWS: '${WORKER_MAX_CACHED_WORKFLOWS:-}'
     depends_on:
       - postgres
       - temporal
+      - vendors
     restart: on-failure:10
+  # The external vendors, as an AWS Lambda container image. Locally it runs a
+  # concurrent Invoke-API server instead of the single-invocation emulator.
+  vendors:
+    build: ./lambdas/vendors
+    entrypoint: ['node', '/var/task/local-server.js']
+    environment:
+      DATABASE_URL: 'postgres://user:password@postgres:5432/workflows'
+      PG_POOL_MAX: '10' # per process
+      LOCAL_LAMBDA_PROCESSES: '${LOCAL_LAMBDA_PROCESSES:-4}' # local stand-in for Lambda scaling out
+      # Failure injection for demos (see lambdas/vendors/index.ts):
+      MOCK_FAILURE_RATE: '${MOCK_FAILURE_RATE:-0}' # 0-1, fails before doing any work
+      MOCK_FAILING_SYSTEMS: '${MOCK_FAILING_SYSTEMS:-}' # e.g. "github,slack"
+      MOCK_LOST_RESPONSE_RATE: '${MOCK_LOST_RESPONSE_RATE:-0}' # 0-1, work done but response lost
+    depends_on:
+      - postgres
+  # --- Local monitoring (not deployed to AWS) ---
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - '9090:9090'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - app
+      - worker
+      - temporal
+  grafana:
+    image: grafana/grafana:11.3.1
+    ports:
+      - '3001:3000' # 3000 is taken by the API
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: 'true' # local only: no login
+      GF_AUTH_ANONYMOUS_ORG_ROLE: 'Admin'
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/onboarding.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+  # Load generator, only started on demand: docker compose --profile loadtest run --rm k6
+  k6:
+    image: grafana/k6:0.54.0
+    profiles: ['loadtest']
+    command: ['run', '--summary-export=/scripts/results/summary.json', '/scripts/k6.js']
+    environment:
+      BASE_URL: 'http://app:3000'
+    volumes:
+      - ./loadtest:/scripts
+    depends_on:
+      - app

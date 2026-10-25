@@ -1,12 +1,17 @@
 // Root NestJS module that wires up the controllers and services.
 
 import { Module } from '@nestjs/common';
-import { WorkflowController } from './workflow.controller';
+import { DatabaseService } from './database.service';
+import { EmployeesController } from './employees.controller';
+import { HealthController } from './health.controller';
+import { MetricsController } from './metrics';
+import { OffboardingController } from './offboarding.controller';
+import { OnboardingController } from './onboarding.controller';
 import { TemporalService } from './temporal.service';
 
 @Module({
   imports: [],
-  controllers: [WorkflowController],
-  providers: [TemporalService],
+  controllers: [OnboardingController, OffboardingController, EmployeesController, MetricsController, HealthController],
+  providers: [TemporalService, DatabaseService],
 })
 export class AppModule {}
