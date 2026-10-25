@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars (git-ignored) and fill in.
+alert_email = "almanzarortizjeffrey@gmail.com"
+
+# Optional overrides:
+# instance_type          = "t4g.small"
+# allowed_cidrs          = ["203.0.113.10/32"]   # default: your current public IP
+# real_charges_alert_usd = 1
+# credit_burn_alert_usd  = 25

@@ -1,0 +1,44 @@
+#!/bin/bash
+# First-boot setup (cloud-init). Log: /var/log/cloud-init-output.log
+set -euxo pipefail
+
+# Swap as a safety margin for memory spikes on a small instance.
+if [ ! -f /swapfile ]; then
+  dd if=/dev/zero of=/swapfile bs=1M count=1024
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+dnf install -y docker
+systemctl enable --now docker
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl -fsSL https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-${compose_arch} \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+mkdir -p /opt/onboarding
+cd /opt/onboarding
+
+cat > docker-compose.yml <<'COMPOSE'
+${compose}
+COMPOSE
+
+# The DB password never appears in user data: it is read from SSM at boot.
+umask 077
+echo "DB_PASSWORD=$(aws ssm get-parameter --region ${region} --name ${db_password_param} --with-decryption --query Parameter.Value --output text)" > .env
+umask 022
+
+# Also used by scripts/redeploy.sh (through SSM Run Command) to roll out new images.
+cat > deploy.sh <<'DEPLOY'
+#!/bin/bash
+set -euo pipefail
+cd /opt/onboarding
+aws ecr get-login-password --region ${region} | docker login --username AWS --password-stdin ${registry}
+docker compose pull --quiet
+docker compose up -d --remove-orphans
+docker image prune -f
+DEPLOY
+chmod +x deploy.sh
+./deploy.sh

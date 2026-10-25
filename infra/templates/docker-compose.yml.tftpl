@@ -1,0 +1,71 @@
+# Production stack on the EC2 host (rendered by Terraform). Differences from the
+# local docker-compose.yml: images come from ECR, vendors are the real Lambda,
+# no monitoring, memory-conscious settings, and nothing is exposed except the API.
+# DB_PASSWORD comes from .env, written at boot from SSM Parameter Store.
+services:
+  postgres:
+    image: postgres:13
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: onboarding
+      POSTGRES_PASSWORD: $${DB_PASSWORD}
+      POSTGRES_DB: workflows
+    command: ['postgres', '-c', 'max_connections=80', '-c', 'shared_buffers=64MB']
+    ports:
+      - '5432:5432' # for the vendors Lambda; the security group allows only the Lambda
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  temporal:
+    image: temporalio/auto-setup:1.24.2
+    restart: unless-stopped
+    environment:
+      DB: postgres12
+      DB_PORT: '5432'
+      POSTGRES_USER: onboarding
+      POSTGRES_PWD: $${DB_PASSWORD}
+      POSTGRES_SEEDS: postgres
+    depends_on:
+      - postgres
+
+  temporal-ui:
+    image: temporalio/ui:2.26.2
+    restart: unless-stopped
+    environment:
+      TEMPORAL_ADDRESS: 'temporal:7233'
+    ports:
+      - '127.0.0.1:8080:8080' # reach it through an SSM port-forwarding session
+    depends_on:
+      - temporal
+
+  app:
+    image: ${app_image}
+    restart: unless-stopped
+    environment:
+      TEMPORAL_ADDRESS: 'temporal:7233'
+      DATABASE_URL: 'postgres://onboarding:$${DB_PASSWORD}@postgres:5432/workflows'
+      NODE_OPTIONS: '--max-old-space-size=256'
+    ports:
+      - '3000:3000'
+    depends_on:
+      - postgres
+      - temporal
+
+  worker:
+    image: ${app_image}
+    command: ['node', 'dist/worker']
+    restart: unless-stopped
+    environment:
+      TEMPORAL_ADDRESS: 'temporal:7233'
+      DATABASE_URL: 'postgres://onboarding:$${DB_PASSWORD}@postgres:5432/workflows'
+      # Real AWS Lambda: no LAMBDA_ENDPOINT override; credentials come from the instance role.
+      VENDOR_FUNCTION_NAME: '${lambda_function_name}'
+      AWS_REGION: '${region}'
+      WORKER_MAX_CACHED_WORKFLOWS: '200' # bounded memory on a small host
+      NODE_OPTIONS: '--max-old-space-size=384'
+    depends_on:
+      - postgres
+      - temporal
+
+volumes:
+  pgdata:

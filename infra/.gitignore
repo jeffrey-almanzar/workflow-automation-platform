@@ -1,0 +1,5 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+# Holds your email; copy terraform.tfvars.example
+terraform.tfvars
